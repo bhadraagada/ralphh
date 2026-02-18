@@ -132,7 +132,7 @@ program
             cwd,
             task: task.description,
             validate: task.validate,
-            maxIterations: task.maxIterations,
+            maxIterations: task.maxIterations ?? config.maxIterations,
             progressFile: config.progressFile,
             failureContextMaxChars: config.failureContextMaxChars,
             gitCheckpoint: config.gitCheckpoint,

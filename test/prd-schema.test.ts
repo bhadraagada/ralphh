@@ -65,7 +65,7 @@ describe("PrdSchema", () => {
     });
     expect(prd.name).toBe("My Project");
     expect(prd.validate).toEqual(["npm test"]);
-    expect(prd.maxIterations).toBe(50);
+    expect(prd.maxIterations).toBeUndefined();
     expect(prd.tasks).toHaveLength(1);
   });
 

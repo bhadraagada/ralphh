@@ -61,8 +61,8 @@ export const PrdSchema = z.object({
     .array(z.string().min(1))
     .default(["npm test"]),
 
-  /** Default max iterations per task */
-  maxIterations: z.number().int().positive().default(50),
+  /** Default max iterations per task (if omitted, falls back to ralph.json config) */
+  maxIterations: z.number().int().positive().optional(),
 
   /** Ordered list of tasks */
   tasks: z.array(PrdTaskSchema).min(1, "PRD must have at least one task"),
@@ -77,7 +77,8 @@ export interface ResolvedTask {
   name: string;
   description: string;
   validate: string[];
-  maxIterations: number;
+  /** Max iterations for this task. undefined = use ralph.json config value */
+  maxIterations: number | undefined;
   dependsOn: string[];
   acceptanceCriteria: string[];
   skip: boolean;
