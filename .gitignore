@@ -2,3 +2,5 @@ node_modules/
 dist/
 *.tsbuildinfo
 ralph-progress.md
+prd.json
+ralph.json
