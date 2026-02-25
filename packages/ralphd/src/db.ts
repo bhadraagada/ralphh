@@ -2,6 +2,7 @@ import { Database } from "bun:sqlite";
 import { randomUUID } from "node:crypto";
 import {
   type AgentName,
+  type AutomationRecord,
   type EventRecord,
   type EventType,
   type ReviewCommentRecord,
@@ -97,8 +98,11 @@ export class RalphDatabase {
         id TEXT PRIMARY KEY,
         name TEXT NOT NULL,
         cron TEXT NOT NULL,
+        thread_id TEXT,
+        max_iterations INTEGER,
         thread_template_json TEXT NOT NULL,
         enabled INTEGER NOT NULL DEFAULT 1,
+        last_run_at INTEGER,
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL
       );
@@ -113,6 +117,9 @@ export class RalphDatabase {
     this.ensureColumn("threads", "branch_name", "TEXT");
     this.ensureColumn("runs", "task_override", "TEXT");
     this.ensureColumn("runs", "source_run_id", "TEXT");
+    this.ensureColumn("automations", "thread_id", "TEXT");
+    this.ensureColumn("automations", "max_iterations", "INTEGER");
+    this.ensureColumn("automations", "last_run_at", "INTEGER");
 
     this.db.exec(`
       UPDATE threads
@@ -561,6 +568,131 @@ export class RalphDatabase {
       .run(threadId, ...ids);
   }
 
+  createAutomation(input: {
+    name: string;
+    cron: string;
+    threadId: string;
+    maxIterations: number;
+    enabled: boolean;
+  }): AutomationRecord {
+    const id = randomUUID();
+    const now = Date.now();
+
+    this.db
+      .query(
+        `
+        INSERT INTO automations (
+          id,
+          name,
+          cron,
+          thread_id,
+          max_iterations,
+          thread_template_json,
+          enabled,
+          created_at,
+          updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `
+      )
+      .run(
+        id,
+        input.name,
+        input.cron,
+        input.threadId,
+        input.maxIterations,
+        "{}",
+        input.enabled ? 1 : 0,
+        now,
+        now
+      );
+
+    return this.getAutomation(id)!;
+  }
+
+  listAutomations(): AutomationRecord[] {
+    const rows = this.db
+      .query(
+        `
+        SELECT id, name, cron, thread_id, max_iterations, enabled, last_run_at, created_at, updated_at
+        FROM automations
+        ORDER BY updated_at DESC
+      `
+      )
+      .all() as Array<{
+      id: string;
+      name: string;
+      cron: string;
+      thread_id: string | null;
+      max_iterations: number | null;
+      enabled: number;
+      last_run_at: number | null;
+      created_at: number;
+      updated_at: number;
+    }>;
+
+    return rows.map((row) => this.mapAutomationRow(row));
+  }
+
+  getAutomation(id: string): AutomationRecord | undefined {
+    const row = this.db
+      .query(
+        `
+        SELECT id, name, cron, thread_id, max_iterations, enabled, last_run_at, created_at, updated_at
+        FROM automations
+        WHERE id = ?
+      `
+      )
+      .get(id) as
+      | {
+          id: string;
+          name: string;
+          cron: string;
+          thread_id: string | null;
+          max_iterations: number | null;
+          enabled: number;
+          last_run_at: number | null;
+          created_at: number;
+          updated_at: number;
+        }
+      | undefined;
+
+    if (!row) {
+      return undefined;
+    }
+
+    return this.mapAutomationRow(row);
+  }
+
+  updateAutomationEnabled(id: string, enabled: boolean): AutomationRecord | undefined {
+    this.db
+      .query(
+        `
+        UPDATE automations
+        SET enabled = ?, updated_at = ?
+        WHERE id = ?
+      `
+      )
+      .run(enabled ? 1 : 0, Date.now(), id);
+
+    return this.getAutomation(id);
+  }
+
+  markAutomationTriggered(id: string): AutomationRecord | undefined {
+    const now = Date.now();
+    this.db
+      .query(
+        `
+        UPDATE automations
+        SET last_run_at = ?, updated_at = ?
+        WHERE id = ?
+      `
+      )
+      .run(now, now, id);
+
+    return this.getAutomation(id);
+  }
+
   private mapThreadRow(row: {
     id: string;
     name: string;
@@ -654,6 +786,30 @@ export class RalphDatabase {
       body: row.body,
       status: row.status,
       createdAt: row.created_at,
+    };
+  }
+
+  private mapAutomationRow(row: {
+    id: string;
+    name: string;
+    cron: string;
+    thread_id: string | null;
+    max_iterations: number | null;
+    enabled: number;
+    last_run_at: number | null;
+    created_at: number;
+    updated_at: number;
+  }): AutomationRecord {
+    return {
+      id: row.id,
+      name: row.name,
+      cron: row.cron,
+      threadId: row.thread_id ?? "",
+      maxIterations: row.max_iterations ?? 10,
+      enabled: row.enabled === 1,
+      lastRunAt: row.last_run_at ?? undefined,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
     };
   }
 }

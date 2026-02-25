@@ -9,6 +9,7 @@ Shared backend control plane for Ralph Studio.
 - SQLite persistence
 - Live event streaming over WebSocket
 - REST API for CLI/Desktop clients
+- Automation scheduler for recurring thread runs (simple cron)
 
 ## Local development
 
