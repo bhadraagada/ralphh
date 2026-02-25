@@ -1,16 +1,21 @@
 {
-  "name": "ralph-loop",
+  "name": "ralphh-monorepo",
   "version": "0.1.0",
-  "description": "Stateless AI agent automation loop - eliminates context rot by restarting fresh each iteration",
-  "type": "module",
-  "bin": {
-    "ralph": "./dist/index.js"
-  },
+  "private": true,
+  "packageManager": "bun@1.3.1",
+  "description": "Ralph Studio monorepo: CLI, backend orchestrator, and desktop app",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
   "scripts": {
-    "build": "bun build src/index.ts --outdir dist --target node",
-    "dev": "bun run src/index.ts",
-    "test": "bun test",
-    "typecheck": "tsc --noEmit"
+    "dev": "turbo run dev --parallel --filter=@ralphh/ralphd --filter=@ralphh/desktop --ui tui",
+    "build": "turbo run build",
+    "test": "turbo run test",
+    "typecheck": "turbo run typecheck",
+    "dev:cli": "turbo run dev --filter=@ralphh/cli",
+    "dev:backend": "turbo run dev --filter=@ralphh/ralphd",
+    "dev:desktop": "turbo run dev --filter=@ralphh/desktop"
   },
   "dependencies": {
     "@clack/prompts": "^1.0.1",
@@ -21,6 +26,8 @@
   },
   "devDependencies": {
     "@types/bun": "^1.2.4",
-    "typescript": "^5.7.3"
+    "@types/node": "^22.10.2",
+    "typescript": "^5.7.3",
+    "turbo": "^2.8.11"
   }
 }
