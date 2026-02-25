@@ -4,6 +4,7 @@ import { existsSync, mkdirSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { z } from "zod";
 import {
+  type CreateAutomationRequest,
   type BroadcastEnvelope,
   type CreateReviewCommentRequest,
   type CreateRunRequest,
@@ -19,6 +20,7 @@ import type { RalphConfig } from "../../../src/config/schema.js";
 import { spawnProcess } from "../../../src/utils/process.js";
 import { runTaskLoop, type LoopEvent } from "../../../src/loop/runner.js";
 import { RalphDatabase } from "./db.js";
+import { AutomationScheduler } from "./automation-scheduler.js";
 import { RunQueue, TERMINAL_RUN_STATES } from "./queue.js";
 import { createThreadWorktree } from "./worktree.js";
 
@@ -41,6 +43,18 @@ const createRunSchema = z.object({
 
 const runControlSchema = z.object({
   action: z.enum(["pause", "resume", "stop", "retry"]),
+});
+
+const createAutomationSchema = z.object({
+  name: z.string().min(1),
+  cron: z.string().min(1),
+  threadId: z.string().min(1),
+  maxIterations: z.number().int().positive().optional(),
+  enabled: z.boolean().optional(),
+});
+
+const toggleAutomationSchema = z.object({
+  enabled: z.boolean(),
 });
 
 const createReviewCommentSchema = z.object({
@@ -184,6 +198,16 @@ const queue = new RunQueue(
   Number(process.env.RALPHD_CONCURRENCY ?? 2)
 );
 
+const scheduler = new AutomationScheduler(db, {
+  onEvent: (threadId, runId, type, payload) => {
+    emitEvent(threadId, runId, type, payload);
+  },
+  onRunQueued: (run) => {
+    queue.enqueue(run.id);
+  },
+});
+scheduler.start();
+
 function withCorsHeaders(init: ResponseInit = {}): ResponseInit {
   const headers = new Headers(init.headers);
   headers.set("Access-Control-Allow-Origin", "*");
@@ -256,6 +280,41 @@ const server = Bun.serve({
       });
     }
 
+    if (request.method === "GET" && url.pathname === "/automations") {
+      return json({
+        automations: db.listAutomations(),
+      });
+    }
+
+    if (request.method === "POST" && url.pathname === "/automations") {
+      try {
+        const body = await readJson<CreateAutomationRequest>(request, createAutomationSchema);
+        const thread = db.getThread(body.threadId);
+        if (!thread) {
+          return json({ error: "Thread not found" }, 404);
+        }
+
+        const automation = db.createAutomation({
+          name: body.name,
+          cron: body.cron,
+          threadId: body.threadId,
+          maxIterations: body.maxIterations ?? 10,
+          enabled: body.enabled ?? true,
+        });
+
+        emitEvent(thread.id, undefined, "automation.created", {
+          automationId: automation.id,
+          cron: automation.cron,
+          enabled: automation.enabled,
+        });
+
+        return json({ automation }, 201);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        return json({ error: message }, 400);
+      }
+    }
+
     if (request.method === "POST" && url.pathname === "/threads") {
       try {
         const body = await readJson<CreateThreadRequest>(request, createThreadSchema);
@@ -287,6 +346,44 @@ const server = Bun.serve({
         });
 
         return json({ thread }, 201);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        return json({ error: message }, 400);
+      }
+    }
+
+    if (
+      request.method === "POST" &&
+      parts.length === 3 &&
+      parts[0] === "automations" &&
+      parts[2] === "toggle"
+    ) {
+      const automationId = parts[1];
+      const automation = db.getAutomation(automationId);
+      if (!automation) {
+        return json({ error: "Automation not found" }, 404);
+      }
+
+      try {
+        const body = await readJson<{ enabled: boolean }>(request, toggleAutomationSchema);
+        const updated = db.updateAutomationEnabled(automationId, body.enabled);
+        return json({ automation: updated });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        return json({ error: message }, 400);
+      }
+    }
+
+    if (
+      request.method === "POST" &&
+      parts.length === 3 &&
+      parts[0] === "automations" &&
+      parts[2] === "run-now"
+    ) {
+      const automationId = parts[1];
+      try {
+        const run = await scheduler.triggerNow(automationId);
+        return json({ run }, 201);
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         return json({ error: message }, 400);

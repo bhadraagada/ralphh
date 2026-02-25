@@ -25,6 +25,7 @@ import {
   X,
 } from "lucide-react";
 import type {
+  AutomationRecord,
   BroadcastEnvelope,
   EventRecord,
   ReviewCommentRecord,
@@ -113,6 +114,8 @@ function eventLabel(event: EventRecord): string {
     "thread.worktree.created": "Created worktree",
     "review.comment.created": "Review comment added",
     "review.rerun.queued": "Feedback rerun queued",
+    "automation.created": "Automation created",
+    "automation.triggered": "Automation triggered",
     "run.queued": "Queued run",
     "run.started": "Started run",
     "run.paused": "Paused run",
@@ -239,9 +242,13 @@ export default function App() {
   const [theme, setTheme] = useState<ThemeMode>("light");
 
   const [showCreateThread, setShowCreateThread] = useState(false);
+  const [showAutomations, setShowAutomations] = useState(false);
   const [newThreadName, setNewThreadName] = useState("");
   const [newThreadTask, setNewThreadTask] = useState("");
   const [newThreadRepo, setNewThreadRepo] = useState("");
+  const [automations, setAutomations] = useState<AutomationRecord[]>([]);
+  const [newAutomationName, setNewAutomationName] = useState("");
+  const [newAutomationCron, setNewAutomationCron] = useState("0 9 * * *");
 
   const [workspaceDropdownOpen, setWorkspaceDropdownOpen] = useState(false);
   const [selectedWorkspace, setSelectedWorkspace] = useState<string>("all");
@@ -368,8 +375,18 @@ export default function App() {
     }
   }
 
+  async function loadAutomations(): Promise<void> {
+    try {
+      const data = await getJson<{ automations: AutomationRecord[] }>("/automations");
+      setAutomations(data.automations);
+    } catch {
+      setAutomations([]);
+    }
+  }
+
   useEffect(() => {
     void loadThreads();
+    void loadAutomations();
   }, []);
 
   useEffect(() => {
@@ -406,6 +423,7 @@ export default function App() {
         }
 
         void loadThreads();
+        void loadAutomations();
       } catch {
         return;
       }
@@ -522,6 +540,51 @@ export default function App() {
     }
   }
 
+  async function handleCreateAutomation(): Promise<void> {
+    if (!selectedThreadId) {
+      setError("Select a thread before creating an automation.");
+      return;
+    }
+
+    if (!newAutomationName.trim() || !newAutomationCron.trim()) {
+      setError("Automation name and cron are required.");
+      return;
+    }
+
+    try {
+      await postJson("/automations", {
+        name: newAutomationName,
+        cron: newAutomationCron,
+        threadId: selectedThreadId,
+        maxIterations: 10,
+      });
+      setNewAutomationName("");
+      setShowAutomations(false);
+      await loadAutomations();
+    } catch (automationError) {
+      setError(automationError instanceof Error ? automationError.message : String(automationError));
+    }
+  }
+
+  async function handleToggleAutomation(automationId: string, enabled: boolean): Promise<void> {
+    try {
+      await postJson(`/automations/${automationId}/toggle`, { enabled });
+      await loadAutomations();
+    } catch (automationError) {
+      setError(automationError instanceof Error ? automationError.message : String(automationError));
+    }
+  }
+
+  async function handleRunAutomationNow(automationId: string): Promise<void> {
+    try {
+      await postJson(`/automations/${automationId}/run-now`, {});
+      await loadAutomations();
+      await loadThreads();
+    } catch (automationError) {
+      setError(automationError instanceof Error ? automationError.message : String(automationError));
+    }
+  }
+
   async function handleComposerSend(): Promise<void> {
     if (!selectedThreadId) {
       setError("Select or create a thread before starting a run.");
@@ -599,12 +662,22 @@ export default function App() {
             <Button
               variant="ghost"
               className="w-full justify-start"
-              onClick={() => setShowCreateThread((prev) => !prev)}
+              onClick={() => {
+                setShowCreateThread((prev) => !prev);
+                setShowAutomations(false);
+              }}
             >
               <Plus className="mr-2 h-4 w-4" />
               New thread
             </Button>
-            <Button variant="ghost" className="w-full justify-start" disabled>
+            <Button
+              variant="ghost"
+              className="w-full justify-start"
+              onClick={() => {
+                setShowAutomations((prev) => !prev);
+                setShowCreateThread(false);
+              }}
+            >
               <Timer className="mr-2 h-4 w-4" />
               Automations
             </Button>
@@ -638,6 +711,67 @@ export default function App() {
                 <Button className="w-full" onClick={() => void handleCreateThread()}>
                   Create
                 </Button>
+              </div>
+            </div>
+          )}
+
+          {showAutomations && (
+            <div className="mb-3 rounded-lg border border-border bg-card p-3">
+              <p className="mb-2 text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                New automation
+              </p>
+              <div className="space-y-2">
+                <Input
+                  placeholder="Automation name"
+                  value={newAutomationName}
+                  onChange={(event) => setNewAutomationName(event.target.value)}
+                />
+                <Input
+                  placeholder="Cron (m h dom mon dow)"
+                  value={newAutomationCron}
+                  onChange={(event) => setNewAutomationCron(event.target.value)}
+                />
+                <Button className="w-full" onClick={() => void handleCreateAutomation()}>
+                  Save automation
+                </Button>
+              </div>
+
+              <div className="mt-3 space-y-2">
+                {automations.length === 0 ? (
+                  <p className="text-xs text-muted-foreground">No automations yet.</p>
+                ) : (
+                  automations.map((automation) => (
+                    <div key={automation.id} className="rounded-md border border-border p-2">
+                      <div className="mb-1 flex items-center justify-between gap-2">
+                        <p className="truncate text-xs font-medium">{automation.name}</p>
+                        <Badge variant={automation.enabled ? "success" : "default"}>
+                          {automation.enabled ? "on" : "off"}
+                        </Badge>
+                      </div>
+                      <p className="mb-2 text-[11px] text-muted-foreground">{automation.cron}</p>
+                      <div className="flex items-center gap-2">
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          className="h-7 text-[11px]"
+                          onClick={() => void handleRunAutomationNow(automation.id)}
+                        >
+                          Run now
+                        </Button>
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          className="h-7 text-[11px]"
+                          onClick={() =>
+                            void handleToggleAutomation(automation.id, !automation.enabled)
+                          }
+                        >
+                          {automation.enabled ? "Disable" : "Enable"}
+                        </Button>
+                      </div>
+                    </div>
+                  ))
+                )}
               </div>
             </div>
           )}
