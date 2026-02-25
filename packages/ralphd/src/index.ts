@@ -5,15 +5,18 @@ import { randomUUID } from "node:crypto";
 import { z } from "zod";
 import {
   type BroadcastEnvelope,
+  type CreateReviewCommentRequest,
   type CreateRunRequest,
   type CreateThreadRequest,
   type EventRecord,
   type EventType,
+  type FeedbackRerunRequest,
   type RunControlRequest,
   type RunRecord,
   type ThreadRecord,
 } from "@ralphh/shared";
 import type { RalphConfig } from "../../../src/config/schema.js";
+import { spawnProcess } from "../../../src/utils/process.js";
 import { runTaskLoop, type LoopEvent } from "../../../src/loop/runner.js";
 import { RalphDatabase } from "./db.js";
 import { RunQueue, TERMINAL_RUN_STATES } from "./queue.js";
@@ -32,10 +35,23 @@ const createThreadSchema = z.object({
 
 const createRunSchema = z.object({
   maxIterations: z.number().int().positive().optional(),
+  taskOverride: z.string().min(1).optional(),
+  sourceRunId: z.string().min(1).optional(),
 });
 
 const runControlSchema = z.object({
   action: z.enum(["pause", "resume", "stop", "retry"]),
+});
+
+const createReviewCommentSchema = z.object({
+  runId: z.string().min(1).optional(),
+  filePath: z.string().min(1),
+  lineNumber: z.number().int().positive(),
+  body: z.string().min(1),
+});
+
+const feedbackRerunSchema = z.object({
+  commentIds: z.array(z.number().int().positive()).min(1),
 });
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -92,7 +108,7 @@ async function executeRun(run: RunRecord, signal: AbortSignal): Promise<void> {
 
   const config: RalphConfig = {
     agent: thread.agent,
-    task: thread.task,
+    task: run.taskOverride ?? thread.task,
     validate: thread.validate,
     maxIterations: run.maxIterations,
     delay: 0,
@@ -106,7 +122,7 @@ async function executeRun(run: RunRecord, signal: AbortSignal): Promise<void> {
   const result = await runTaskLoop({
     config,
     cwd: thread.worktreePath ?? thread.repoPath,
-    task: thread.task,
+    task: run.taskOverride ?? thread.task,
     validate: thread.validate,
     maxIterations: run.maxIterations,
     progressFile: `ralph-progress-${thread.id}.md`,
@@ -312,10 +328,152 @@ const server = Bun.serve({
         const run = db.createRun({
           threadId,
           maxIterations: body.maxIterations ?? 10,
+          taskOverride: body.taskOverride,
+          sourceRunId: body.sourceRunId,
         });
 
         emitEvent(threadId, run.id, "run.queued", {
           maxIterations: run.maxIterations,
+        });
+
+        queue.enqueue(run.id);
+        return json({ run }, 201);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        return json({ error: message }, 400);
+      }
+    }
+
+    if (
+      request.method === "GET" &&
+      parts.length === 3 &&
+      parts[0] === "threads" &&
+      parts[2] === "diff"
+    ) {
+      const threadId = parts[1];
+      const thread = db.getThread(threadId);
+      if (!thread) {
+        return json({ error: "Thread not found" }, 404);
+      }
+
+      const cwd = thread.worktreePath ?? thread.repoPath;
+      const diffResult = await spawnProcess({
+        command: "git",
+        args: ["diff", "--no-color"],
+        cwd,
+      });
+
+      if (diffResult.exitCode !== 0) {
+        return json(
+          {
+            error: diffResult.stderr || "Failed to generate diff",
+          },
+          500
+        );
+      }
+
+      return json({
+        diff: diffResult.stdout,
+      });
+    }
+
+    if (
+      request.method === "GET" &&
+      parts.length === 3 &&
+      parts[0] === "threads" &&
+      parts[2] === "comments"
+    ) {
+      const threadId = parts[1];
+      const thread = db.getThread(threadId);
+      if (!thread) {
+        return json({ error: "Thread not found" }, 404);
+      }
+
+      return json({
+        comments: db.listReviewCommentsByThread(threadId, 250),
+      });
+    }
+
+    if (
+      request.method === "POST" &&
+      parts.length === 3 &&
+      parts[0] === "threads" &&
+      parts[2] === "comments"
+    ) {
+      const threadId = parts[1];
+      const thread = db.getThread(threadId);
+      if (!thread) {
+        return json({ error: "Thread not found" }, 404);
+      }
+
+      try {
+        const body = await readJson<CreateReviewCommentRequest>(
+          request,
+          createReviewCommentSchema
+        );
+
+        const comment = db.createReviewComment({
+          threadId,
+          runId: body.runId,
+          filePath: body.filePath,
+          lineNumber: body.lineNumber,
+          body: body.body,
+        });
+
+        emitEvent(threadId, body.runId, "review.comment.created", {
+          reviewCommentId: comment.id,
+          filePath: comment.filePath,
+          lineNumber: comment.lineNumber,
+        });
+
+        return json({ comment }, 201);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        return json({ error: message }, 400);
+      }
+    }
+
+    if (
+      request.method === "POST" &&
+      parts.length === 3 &&
+      parts[0] === "threads" &&
+      parts[2] === "rerun-from-comments"
+    ) {
+      const threadId = parts[1];
+      const thread = db.getThread(threadId);
+      if (!thread) {
+        return json({ error: "Thread not found" }, 404);
+      }
+
+      try {
+        const body = await readJson<FeedbackRerunRequest>(request, feedbackRerunSchema);
+        const comments = db.getReviewCommentsByIds(threadId, body.commentIds);
+        if (comments.length === 0) {
+          return json({ error: "No matching comments found" }, 404);
+        }
+
+        const feedbackBlock = comments
+          .map(
+            (comment, index) =>
+              `${index + 1}. ${comment.filePath}:${comment.lineNumber} - ${comment.body}`
+          )
+          .join("\n");
+
+        const taskOverride = `${thread.task}\n\nAddress the following review feedback before declaring completion:\n${feedbackBlock}`;
+
+        const sourceRunId = comments[0]?.runId;
+        const run = db.createRun({
+          threadId,
+          maxIterations: 10,
+          taskOverride,
+          sourceRunId,
+        });
+
+        db.markReviewCommentsApplied(threadId, body.commentIds);
+
+        emitEvent(threadId, run.id, "review.rerun.queued", {
+          source: "review-feedback",
+          commentIds: body.commentIds,
         });
 
         queue.enqueue(run.id);
