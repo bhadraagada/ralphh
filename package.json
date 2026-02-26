@@ -3,6 +3,36 @@
   "version": "0.1.0",
   "description": "Stateless AI agent automation loop - eliminates context rot by restarting fresh each iteration",
   "type": "module",
+  "license": "MIT",
+  "author": "bhadraagada",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/bhadraagada/ralphh.git"
+  },
+  "bugs": {
+    "url": "https://github.com/bhadraagada/ralphh/issues"
+  },
+  "homepage": "https://github.com/bhadraagada/ralphh#readme",
+  "keywords": [
+    "ai",
+    "agent",
+    "automation",
+    "cli",
+    "claude",
+    "codex",
+    "opencode",
+    "prd",
+    "stateless",
+    "loop"
+  ],
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "files": [
+    "dist",
+    "LICENSE",
+    "README.md"
+  ],
   "bin": {
     "ralph": "./dist/index.js"
   },
