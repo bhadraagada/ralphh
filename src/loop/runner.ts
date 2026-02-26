@@ -33,12 +33,27 @@ export interface RunTaskOptions {
   prdName?: string;
   prdDescription?: string;
   completedTasks?: { id: string; name: string }[];
+  abortSignal?: AbortSignal;
+  onEvent?: (event: LoopEvent) => void;
 }
 
 export interface LoopResult {
   success: boolean;
   iterations: number;
   taskId?: string;
+  cancelled?: boolean;
+}
+
+export interface LoopEvent {
+  type:
+    | "loop.iteration.started"
+    | "loop.agent.spawned"
+    | "loop.agent.exited"
+    | "loop.validation.completed"
+    | "loop.regression.reverted"
+    | "loop.checkpoint.committed";
+  iteration: number;
+  payload?: Record<string, unknown>;
 }
 
 // ─── Core loop runner ────────────────────────────────────────────────────
@@ -59,6 +74,8 @@ export async function runTaskLoop(opts: RunTaskOptions): Promise<LoopResult> {
     prdName,
     prdDescription,
     completedTasks,
+    abortSignal,
+    onEvent,
   } = opts;
 
   const promise = generatePromise();
@@ -89,7 +106,7 @@ export async function runTaskLoop(opts: RunTaskOptions): Promise<LoopResult> {
 
   // Baseline score
   log.info("Running baseline validation...");
-  const baseline = await runValidations(validate, cwd);
+  const baseline = await runValidations(validate, cwd, abortSignal);
   let bestScore = scoreValidation(baseline);
   log.info(`Baseline score: ${bestScore}/${baseline.totalCount} passing`);
 
@@ -102,7 +119,20 @@ export async function runTaskLoop(opts: RunTaskOptions): Promise<LoopResult> {
   let wasReverted = false;
 
   for (let iteration = 1; iteration <= maxIterations; iteration++) {
+    if (abortSignal?.aborted) {
+      return {
+        success: false,
+        iterations: iteration - 1,
+        taskId: prdTask?.id,
+        cancelled: true,
+      };
+    }
+
     log.iteration(iteration, maxIterations);
+    onEvent?.({
+      type: "loop.iteration.started",
+      iteration,
+    });
 
     // 1. Read progress
     const progress = await readProgress(cwd, progressFile);
@@ -136,9 +166,30 @@ export async function runTaskLoop(opts: RunTaskOptions): Promise<LoopResult> {
 
     // 4. Spawn agent
     log.info(`Spawning ${adapter.displayName}...`);
-    const result = await spawnProcess(spawnConfig);
+    onEvent?.({
+      type: "loop.agent.spawned",
+      iteration,
+      payload: {
+        command: spawnConfig.command,
+        args: spawnConfig.args,
+      },
+    });
+
+    const result = await spawnProcess({
+      ...spawnConfig,
+      signal: abortSignal,
+    });
+
     log.info(`Agent exited with code ${result.exitCode} (${result.duration}ms)`);
     log.debug(`Agent stdout length: ${result.stdout.length}`);
+    onEvent?.({
+      type: "loop.agent.exited",
+      iteration,
+      payload: {
+        exitCode: result.exitCode,
+        duration: result.duration,
+      },
+    });
 
     // 5. Check completion promise
     const agentOutput = result.stdout + "\n" + result.stderr;
@@ -149,8 +200,17 @@ export async function runTaskLoop(opts: RunTaskOptions): Promise<LoopResult> {
 
     // 6. Run validation gate (ALWAYS — external validation, not agent's claim)
     log.info("Running validation gate...");
-    const validation = await runValidations(validate, cwd);
+    const validation = await runValidations(validate, cwd, abortSignal);
     const currentScore = scoreValidation(validation);
+    onEvent?.({
+      type: "loop.validation.completed",
+      iteration,
+      payload: {
+        passCount: validation.passCount,
+        totalCount: validation.totalCount,
+        allPassed: validation.allPassed,
+      },
+    });
 
     // 7. Full success: both promise claimed AND all validations pass
     if (claimed && validation.allPassed) {
@@ -172,6 +232,10 @@ export async function runTaskLoop(opts: RunTaskOptions): Promise<LoopResult> {
       if (currentScore < bestScore) {
         log.regression(iteration);
         await git.revertToLastCommit(cwd);
+        onEvent?.({
+          type: "loop.regression.reverted",
+          iteration,
+        });
         wasReverted = true;
         lastFailureOutput = formatFailureContext(validation, failureContextMaxChars);
       } else {
@@ -184,6 +248,14 @@ export async function runTaskLoop(opts: RunTaskOptions): Promise<LoopResult> {
           ? `ralph: [${prdTask.id}] iteration ${iteration} (${currentScore}/${validation.totalCount} passing)`
           : `ralph: iteration ${iteration} (${currentScore}/${validation.totalCount} passing)`;
         await git.commitAll(cwd, msg);
+        onEvent?.({
+          type: "loop.checkpoint.committed",
+          iteration,
+          payload: {
+            score: currentScore,
+            total: validation.totalCount,
+          },
+        });
         lastFailureOutput = formatFailureContext(validation, failureContextMaxChars);
       }
     } else {
