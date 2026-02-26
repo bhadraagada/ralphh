@@ -1,0 +1,102 @@
+name: Bug Report
+description: Report a bug or unexpected behavior in ralph
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug! Please fill out the information below to help us investigate.
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: A clear and concise description of the bug.
+      placeholder: Describe the bug...
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps-to-reproduce
+    attributes:
+      label: Steps to Reproduce
+      description: Steps to reproduce the behavior.
+      placeholder: |
+        1. Run `ralph ...`
+        2. Select '...'
+        3. See error
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected-behavior
+    attributes:
+      label: Expected Behavior
+      description: What you expected to happen.
+      placeholder: Describe what you expected...
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual-behavior
+    attributes:
+      label: Actual Behavior
+      description: What actually happened.
+      placeholder: Describe what actually happened...
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating System
+      description: What OS are you running ralph on?
+      options:
+        - macOS
+        - Linux
+        - Windows
+        - Other
+    validations:
+      required: true
+
+  - type: input
+    id: bun-version
+    attributes:
+      label: Bun Version
+      description: Output of `bun --version`.
+      placeholder: "1.1.0"
+    validations:
+      required: true
+
+  - type: input
+    id: ralph-version
+    attributes:
+      label: Ralph Version
+      description: Output of `ralph --version` or the commit/branch you're on.
+      placeholder: "0.1.0"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: agent
+    attributes:
+      label: AI Agent Used
+      description: Which AI coding agent were you using with ralph?
+      options:
+        - Claude Code
+        - Codex CLI
+        - OpenCode
+        - "N/A"
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs / Error Output
+      description: Paste any relevant log output or error messages. This will be automatically formatted as code.
+      render: shell
+      placeholder: Paste logs here...
+    validations:
+      required: false
