@@ -2,8 +2,10 @@ import { Database } from "bun:sqlite";
 import { randomUUID } from "node:crypto";
 import {
   type AgentName,
+  type AutomationRecord,
   type EventRecord,
   type EventType,
+  type ReviewCommentRecord,
   type RunRecord,
   type RunStatus,
   type ThreadRecord,
@@ -24,6 +26,8 @@ interface CreateThreadInput {
 interface CreateRunInput {
   threadId: string;
   maxIterations: number;
+  taskOverride?: string;
+  sourceRunId?: string;
 }
 
 export class RalphDatabase {
@@ -57,11 +61,26 @@ export class RalphDatabase {
         status TEXT NOT NULL,
         max_iterations INTEGER NOT NULL,
         iterations INTEGER NOT NULL DEFAULT 0,
+        task_override TEXT,
+        source_run_id TEXT,
         error TEXT,
         created_at INTEGER NOT NULL,
         started_at INTEGER,
         finished_at INTEGER,
         FOREIGN KEY(thread_id) REFERENCES threads(id)
+      );
+
+      CREATE TABLE IF NOT EXISTS review_comments (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        thread_id TEXT NOT NULL,
+        run_id TEXT,
+        file_path TEXT NOT NULL,
+        line_number INTEGER NOT NULL,
+        body TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'open',
+        created_at INTEGER NOT NULL,
+        FOREIGN KEY(thread_id) REFERENCES threads(id),
+        FOREIGN KEY(run_id) REFERENCES runs(id)
       );
 
       CREATE TABLE IF NOT EXISTS events (
@@ -79,8 +98,11 @@ export class RalphDatabase {
         id TEXT PRIMARY KEY,
         name TEXT NOT NULL,
         cron TEXT NOT NULL,
+        thread_id TEXT,
+        max_iterations INTEGER,
         thread_template_json TEXT NOT NULL,
         enabled INTEGER NOT NULL DEFAULT 1,
+        last_run_at INTEGER,
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL
       );
@@ -93,6 +115,11 @@ export class RalphDatabase {
     this.ensureColumn("threads", "base_repo_path", "TEXT");
     this.ensureColumn("threads", "worktree_path", "TEXT");
     this.ensureColumn("threads", "branch_name", "TEXT");
+    this.ensureColumn("runs", "task_override", "TEXT");
+    this.ensureColumn("runs", "source_run_id", "TEXT");
+    this.ensureColumn("automations", "thread_id", "TEXT");
+    this.ensureColumn("automations", "max_iterations", "INTEGER");
+    this.ensureColumn("automations", "last_run_at", "INTEGER");
 
     this.db.exec(`
       UPDATE threads
@@ -228,11 +255,20 @@ export class RalphDatabase {
     this.db
       .query(
         `
-        INSERT INTO runs (id, thread_id, status, max_iterations, iterations, created_at)
-        VALUES (?, ?, ?, ?, ?, ?)
+        INSERT INTO runs (id, thread_id, status, max_iterations, iterations, task_override, source_run_id, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
       `
       )
-      .run(id, input.threadId, "queued", input.maxIterations, 0, now);
+      .run(
+        id,
+        input.threadId,
+        "queued",
+        input.maxIterations,
+        0,
+        input.taskOverride ?? null,
+        input.sourceRunId ?? null,
+        now
+      );
 
     this.touchThread(input.threadId);
     return this.getRun(id)!;
@@ -242,7 +278,7 @@ export class RalphDatabase {
     const row = this.db
       .query(
         `
-        SELECT id, thread_id, status, max_iterations, iterations, error, created_at, started_at, finished_at
+        SELECT id, thread_id, status, max_iterations, iterations, task_override, source_run_id, error, created_at, started_at, finished_at
         FROM runs
         WHERE id = ?
       `
@@ -254,6 +290,8 @@ export class RalphDatabase {
           status: RunStatus;
           max_iterations: number;
           iterations: number;
+          task_override: string | null;
+          source_run_id: string | null;
           error: string | null;
           created_at: number;
           started_at: number | null;
@@ -272,7 +310,7 @@ export class RalphDatabase {
     const rows = this.db
       .query(
         `
-        SELECT id, thread_id, status, max_iterations, iterations, error, created_at, started_at, finished_at
+        SELECT id, thread_id, status, max_iterations, iterations, task_override, source_run_id, error, created_at, started_at, finished_at
         FROM runs
         WHERE thread_id = ?
         ORDER BY created_at DESC
@@ -284,6 +322,8 @@ export class RalphDatabase {
       status: RunStatus;
       max_iterations: number;
       iterations: number;
+      task_override: string | null;
+      source_run_id: string | null;
       error: string | null;
       created_at: number;
       started_at: number | null;
@@ -402,6 +442,257 @@ export class RalphDatabase {
     return rows.map((row) => this.mapEventRow(row));
   }
 
+  createReviewComment(input: {
+    threadId: string;
+    runId?: string;
+    filePath: string;
+    lineNumber: number;
+    body: string;
+  }): ReviewCommentRecord {
+    const now = Date.now();
+    const result = this.db
+      .query(
+        `
+        INSERT INTO review_comments (thread_id, run_id, file_path, line_number, body, status, created_at)
+        VALUES (?, ?, ?, ?, ?, 'open', ?)
+      `
+      )
+      .run(
+        input.threadId,
+        input.runId ?? null,
+        input.filePath,
+        input.lineNumber,
+        input.body,
+        now
+      );
+
+    return this.getReviewComment(Number(result.lastInsertRowid))!;
+  }
+
+  getReviewComment(id: number): ReviewCommentRecord | undefined {
+    const row = this.db
+      .query(
+        `
+        SELECT id, thread_id, run_id, file_path, line_number, body, status, created_at
+        FROM review_comments
+        WHERE id = ?
+      `
+      )
+      .get(id) as
+      | {
+          id: number;
+          thread_id: string;
+          run_id: string | null;
+          file_path: string;
+          line_number: number;
+          body: string;
+          status: "open" | "applied";
+          created_at: number;
+        }
+      | undefined;
+
+    if (!row) {
+      return undefined;
+    }
+
+    return this.mapReviewCommentRow(row);
+  }
+
+  listReviewCommentsByThread(threadId: string, limit = 200): ReviewCommentRecord[] {
+    const rows = this.db
+      .query(
+        `
+        SELECT id, thread_id, run_id, file_path, line_number, body, status, created_at
+        FROM review_comments
+        WHERE thread_id = ?
+        ORDER BY created_at DESC
+        LIMIT ?
+      `
+      )
+      .all(threadId, limit) as Array<{
+      id: number;
+      thread_id: string;
+      run_id: string | null;
+      file_path: string;
+      line_number: number;
+      body: string;
+      status: "open" | "applied";
+      created_at: number;
+    }>;
+
+    return rows.map((row) => this.mapReviewCommentRow(row));
+  }
+
+  getReviewCommentsByIds(threadId: string, ids: number[]): ReviewCommentRecord[] {
+    if (ids.length === 0) {
+      return [];
+    }
+
+    const placeholders = ids.map(() => "?").join(",");
+    const rows = this.db
+      .query(
+        `
+        SELECT id, thread_id, run_id, file_path, line_number, body, status, created_at
+        FROM review_comments
+        WHERE thread_id = ? AND id IN (${placeholders})
+      `
+      )
+      .all(threadId, ...ids) as Array<{
+      id: number;
+      thread_id: string;
+      run_id: string | null;
+      file_path: string;
+      line_number: number;
+      body: string;
+      status: "open" | "applied";
+      created_at: number;
+    }>;
+
+    return rows.map((row) => this.mapReviewCommentRow(row));
+  }
+
+  markReviewCommentsApplied(threadId: string, ids: number[]): void {
+    if (ids.length === 0) {
+      return;
+    }
+
+    const placeholders = ids.map(() => "?").join(",");
+    this.db
+      .query(
+        `
+        UPDATE review_comments
+        SET status = 'applied'
+        WHERE thread_id = ? AND id IN (${placeholders})
+      `
+      )
+      .run(threadId, ...ids);
+  }
+
+  createAutomation(input: {
+    name: string;
+    cron: string;
+    threadId: string;
+    maxIterations: number;
+    enabled: boolean;
+  }): AutomationRecord {
+    const id = randomUUID();
+    const now = Date.now();
+
+    this.db
+      .query(
+        `
+        INSERT INTO automations (
+          id,
+          name,
+          cron,
+          thread_id,
+          max_iterations,
+          thread_template_json,
+          enabled,
+          created_at,
+          updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `
+      )
+      .run(
+        id,
+        input.name,
+        input.cron,
+        input.threadId,
+        input.maxIterations,
+        "{}",
+        input.enabled ? 1 : 0,
+        now,
+        now
+      );
+
+    return this.getAutomation(id)!;
+  }
+
+  listAutomations(): AutomationRecord[] {
+    const rows = this.db
+      .query(
+        `
+        SELECT id, name, cron, thread_id, max_iterations, enabled, last_run_at, created_at, updated_at
+        FROM automations
+        ORDER BY updated_at DESC
+      `
+      )
+      .all() as Array<{
+      id: string;
+      name: string;
+      cron: string;
+      thread_id: string | null;
+      max_iterations: number | null;
+      enabled: number;
+      last_run_at: number | null;
+      created_at: number;
+      updated_at: number;
+    }>;
+
+    return rows.map((row) => this.mapAutomationRow(row));
+  }
+
+  getAutomation(id: string): AutomationRecord | undefined {
+    const row = this.db
+      .query(
+        `
+        SELECT id, name, cron, thread_id, max_iterations, enabled, last_run_at, created_at, updated_at
+        FROM automations
+        WHERE id = ?
+      `
+      )
+      .get(id) as
+      | {
+          id: string;
+          name: string;
+          cron: string;
+          thread_id: string | null;
+          max_iterations: number | null;
+          enabled: number;
+          last_run_at: number | null;
+          created_at: number;
+          updated_at: number;
+        }
+      | undefined;
+
+    if (!row) {
+      return undefined;
+    }
+
+    return this.mapAutomationRow(row);
+  }
+
+  updateAutomationEnabled(id: string, enabled: boolean): AutomationRecord | undefined {
+    this.db
+      .query(
+        `
+        UPDATE automations
+        SET enabled = ?, updated_at = ?
+        WHERE id = ?
+      `
+      )
+      .run(enabled ? 1 : 0, Date.now(), id);
+
+    return this.getAutomation(id);
+  }
+
+  markAutomationTriggered(id: string): AutomationRecord | undefined {
+    const now = Date.now();
+    this.db
+      .query(
+        `
+        UPDATE automations
+        SET last_run_at = ?, updated_at = ?
+        WHERE id = ?
+      `
+      )
+      .run(now, now, id);
+
+    return this.getAutomation(id);
+  }
+
   private mapThreadRow(row: {
     id: string;
     name: string;
@@ -436,6 +727,8 @@ export class RalphDatabase {
     status: RunStatus;
     max_iterations: number;
     iterations: number;
+    task_override: string | null;
+    source_run_id: string | null;
     error: string | null;
     created_at: number;
     started_at: number | null;
@@ -447,6 +740,8 @@ export class RalphDatabase {
       status: row.status,
       maxIterations: row.max_iterations,
       iterations: row.iterations,
+      taskOverride: row.task_override ?? undefined,
+      sourceRunId: row.source_run_id ?? undefined,
       error: row.error ?? undefined,
       createdAt: row.created_at,
       startedAt: row.started_at ?? undefined,
@@ -469,6 +764,52 @@ export class RalphDatabase {
       type: row.type,
       payload: JSON.parse(row.payload_json) as Record<string, unknown>,
       createdAt: row.created_at,
+    };
+  }
+
+  private mapReviewCommentRow(row: {
+    id: number;
+    thread_id: string;
+    run_id: string | null;
+    file_path: string;
+    line_number: number;
+    body: string;
+    status: "open" | "applied";
+    created_at: number;
+  }): ReviewCommentRecord {
+    return {
+      id: row.id,
+      threadId: row.thread_id,
+      runId: row.run_id ?? undefined,
+      filePath: row.file_path,
+      lineNumber: row.line_number,
+      body: row.body,
+      status: row.status,
+      createdAt: row.created_at,
+    };
+  }
+
+  private mapAutomationRow(row: {
+    id: string;
+    name: string;
+    cron: string;
+    thread_id: string | null;
+    max_iterations: number | null;
+    enabled: number;
+    last_run_at: number | null;
+    created_at: number;
+    updated_at: number;
+  }): AutomationRecord {
+    return {
+      id: row.id,
+      name: row.name,
+      cron: row.cron,
+      threadId: row.thread_id ?? "",
+      maxIterations: row.max_iterations ?? 10,
+      enabled: row.enabled === 1,
+      lastRunAt: row.last_run_at ?? undefined,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
     };
   }
 }
