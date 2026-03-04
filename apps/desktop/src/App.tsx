@@ -17,8 +17,12 @@ import {
   Minus,
   Moon,
   Pause,
+  PanelLeft,
+  PanelRight,
   Plus,
   RefreshCw,
+  RotateCcw,
+  Search,
   Send,
   Sparkles,
   Square,
@@ -343,12 +347,31 @@ function parseUnifiedDiff(diff: string): DiffLine[] {
 }
 
 const EDITOR_SESSION_STORAGE_KEY = "ralph-editor-sessions-v1";
+const LAYOUT_PREFS_STORAGE_KEY = "ralph-layout-prefs-v1";
+const DEFAULT_LEFT_SIDEBAR_WIDTH = 316;
+const DEFAULT_RIGHT_PANEL_WIDTH = 320;
+const DEFAULT_EXPLORER_WIDTH = 280;
 
 interface EditorSessionEntry {
   tabs: string[];
   activePath?: string;
   currentPath?: string;
   centerPaneMode?: "activity" | "editor";
+}
+
+interface LayoutPrefs {
+  showLeftSidebar: boolean;
+  showRightPanel: boolean;
+  showExplorer: boolean;
+  leftSidebarWidth: number;
+  rightPanelWidth: number;
+  explorerWidth: number;
+}
+
+interface ResizeState {
+  target: "left" | "right" | "explorer";
+  startX: number;
+  startWidth: number;
 }
 
 class ApiError extends Error {
@@ -377,6 +400,51 @@ function readEditorSessions(): Record<string, EditorSessionEntry> {
     return parsed;
   } catch {
     return {};
+  }
+}
+
+function clampNumber(value: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, value));
+}
+
+function readLayoutPrefs(): LayoutPrefs | undefined {
+  try {
+    const raw = localStorage.getItem(LAYOUT_PREFS_STORAGE_KEY);
+    if (!raw) {
+      return undefined;
+    }
+
+    const parsed = JSON.parse(raw) as Partial<LayoutPrefs>;
+    if (!parsed || typeof parsed !== "object") {
+      return undefined;
+    }
+
+    return {
+      showLeftSidebar: Boolean(parsed.showLeftSidebar ?? true),
+      showRightPanel: Boolean(parsed.showRightPanel ?? true),
+      showExplorer: Boolean(parsed.showExplorer ?? true),
+      leftSidebarWidth: clampNumber(
+        Number(parsed.leftSidebarWidth ?? DEFAULT_LEFT_SIDEBAR_WIDTH),
+        240,
+        520
+      ),
+      rightPanelWidth: clampNumber(
+        Number(parsed.rightPanelWidth ?? DEFAULT_RIGHT_PANEL_WIDTH),
+        260,
+        520
+      ),
+      explorerWidth: clampNumber(Number(parsed.explorerWidth ?? DEFAULT_EXPLORER_WIDTH), 220, 560),
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+function writeLayoutPrefs(prefs: LayoutPrefs): void {
+  try {
+    localStorage.setItem(LAYOUT_PREFS_STORAGE_KEY, JSON.stringify(prefs));
+  } catch {
+    return;
   }
 }
 
@@ -456,6 +524,12 @@ export default function App() {
 
   const [showCreateThread, setShowCreateThread] = useState(false);
   const [showAutomations, setShowAutomations] = useState(false);
+  const [showLeftSidebar, setShowLeftSidebar] = useState(true);
+  const [showRightPanel, setShowRightPanel] = useState(true);
+  const [showExplorer, setShowExplorer] = useState(true);
+  const [leftSidebarWidth, setLeftSidebarWidth] = useState(DEFAULT_LEFT_SIDEBAR_WIDTH);
+  const [rightPanelWidth, setRightPanelWidth] = useState(DEFAULT_RIGHT_PANEL_WIDTH);
+  const [explorerWidth, setExplorerWidth] = useState(DEFAULT_EXPLORER_WIDTH);
   const [newThreadName, setNewThreadName] = useState("");
   const [newThreadTask, setNewThreadTask] = useState("");
   const [newThreadRepo, setNewThreadRepo] = useState("");
@@ -500,7 +574,11 @@ export default function App() {
   const [lineJumpTarget, setLineJumpTarget] = useState<{ path: string; lineNumber: number }>();
   const [quickOpenOpen, setQuickOpenOpen] = useState(false);
   const [quickOpenQuery, setQuickOpenQuery] = useState("");
+  const [quickOpenActiveIndex, setQuickOpenActiveIndex] = useState(0);
+  const [quickOpenLoading, setQuickOpenLoading] = useState(false);
+  const [quickOpenError, setQuickOpenError] = useState<string | undefined>();
   const editorViewRef = useRef<EditorView | null>(null);
+  const resizeStateRef = useRef<ResizeState | null>(null);
   const [editorVersion, setEditorVersion] = useState(0);
 
   const workspaces = useMemo(
@@ -572,12 +650,80 @@ export default function App() {
     if (storedTheme === "light" || storedTheme === "dark") {
       setTheme(storedTheme);
     }
+
+    const prefs = readLayoutPrefs();
+    if (prefs) {
+      setShowLeftSidebar(prefs.showLeftSidebar);
+      setShowRightPanel(prefs.showRightPanel);
+      setShowExplorer(prefs.showExplorer);
+      setLeftSidebarWidth(prefs.leftSidebarWidth);
+      setRightPanelWidth(prefs.rightPanelWidth);
+      setExplorerWidth(prefs.explorerWidth);
+    }
   }, []);
 
   useEffect(() => {
     document.documentElement.classList.toggle("dark", theme === "dark");
     localStorage.setItem("ralph-theme", theme);
   }, [theme]);
+
+  useEffect(() => {
+    writeLayoutPrefs({
+      showLeftSidebar,
+      showRightPanel,
+      showExplorer,
+      leftSidebarWidth,
+      rightPanelWidth,
+      explorerWidth,
+    });
+  }, [
+    showLeftSidebar,
+    showRightPanel,
+    showExplorer,
+    leftSidebarWidth,
+    rightPanelWidth,
+    explorerWidth,
+  ]);
+
+  useEffect(() => {
+    const handleMouseMove = (event: MouseEvent) => {
+      const state = resizeStateRef.current;
+      if (!state) {
+        return;
+      }
+
+      const delta = event.clientX - state.startX;
+      if (state.target === "left") {
+        setLeftSidebarWidth(clampNumber(state.startWidth + delta, 240, 520));
+        return;
+      }
+
+      if (state.target === "right") {
+        setRightPanelWidth(clampNumber(state.startWidth - delta, 260, 520));
+        return;
+      }
+
+      setExplorerWidth(clampNumber(state.startWidth + delta, 220, 560));
+    };
+
+    const handleMouseUp = () => {
+      if (!resizeStateRef.current) {
+        return;
+      }
+
+      resizeStateRef.current = null;
+      document.body.style.userSelect = "";
+      document.body.style.cursor = "";
+    };
+
+    window.addEventListener("mousemove", handleMouseMove);
+    window.addEventListener("mouseup", handleMouseUp);
+
+    return () => {
+      window.removeEventListener("mousemove", handleMouseMove);
+      window.removeEventListener("mouseup", handleMouseUp);
+    };
+  }, []);
 
   useEffect(() => {
     if (!windowControls) {
@@ -738,13 +884,61 @@ export default function App() {
     }
   }
 
-  async function loadWorkspaceFileIndex(threadId: string): Promise<void> {
+  async function loadWorkspaceFileIndex(threadId: string): Promise<string[]> {
     try {
       const data = await getJson<WorkspaceFileIndexResponse>(`/threads/${threadId}/files/index`);
       setWorkspaceFileIndex(data.files);
-    } catch {
-      setWorkspaceFileIndex([]);
+      setQuickOpenError(undefined);
+      return data.files;
+    } catch (loadError) {
+      const fallback = Array.from(
+        new Set([
+          ...workspaceEntries.filter((entry) => entry.type === "file").map((entry) => entry.path),
+          ...fileTabs.map((tab) => tab.path),
+        ])
+      ).sort((a, b) => a.localeCompare(b));
+
+      setWorkspaceFileIndex(fallback);
+      const message =
+        loadError instanceof Error
+          ? `${loadError.message}. Restart backend to enable full quick search.`
+          : "Quick search index unavailable. Restart backend to enable it.";
+      setQuickOpenError(message);
+      return fallback;
     }
+  }
+
+  async function openQuickOpen(): Promise<void> {
+    if (!selectedThreadId) {
+      return;
+    }
+
+    setCenterPaneMode("editor");
+    setQuickOpenQuery("");
+    setQuickOpenActiveIndex(0);
+    setQuickOpenOpen(true);
+
+    if (workspaceFileIndex.length > 0) {
+      return;
+    }
+
+    setQuickOpenLoading(true);
+    try {
+      await loadWorkspaceFileIndex(selectedThreadId);
+    } finally {
+      setQuickOpenLoading(false);
+    }
+  }
+
+  function closeQuickOpen(): void {
+    setQuickOpenOpen(false);
+    setQuickOpenQuery("");
+    setQuickOpenActiveIndex(0);
+  }
+
+  function openQuickOpenCandidate(path: string): void {
+    void openWorkspaceFile(path);
+    closeQuickOpen();
   }
 
   function confirmDiscardUnsavedChanges(nextAction: string): boolean {
@@ -767,6 +961,29 @@ export default function App() {
     }
 
     setSelectedThreadId(threadId);
+  }
+
+  function startResize(target: ResizeState["target"], clientX: number): void {
+    const startWidth =
+      target === "left" ? leftSidebarWidth : target === "right" ? rightPanelWidth : explorerWidth;
+
+    resizeStateRef.current = {
+      target,
+      startX: clientX,
+      startWidth,
+    };
+
+    document.body.style.userSelect = "none";
+    document.body.style.cursor = "col-resize";
+  }
+
+  function handleResetLayout(): void {
+    setShowLeftSidebar(true);
+    setShowRightPanel(true);
+    setShowExplorer(true);
+    setLeftSidebarWidth(DEFAULT_LEFT_SIDEBAR_WIDTH);
+    setRightPanelWidth(DEFAULT_RIGHT_PANEL_WIDTH);
+    setExplorerWidth(DEFAULT_EXPLORER_WIDTH);
   }
 
   async function restoreEditorSession(threadId: string): Promise<void> {
@@ -1041,6 +1258,9 @@ export default function App() {
       setWorkspaceEntries([]);
       setWorkspaceFileIndex([]);
       setWorkspaceError(undefined);
+      setQuickOpenError(undefined);
+      setQuickOpenLoading(false);
+      closeQuickOpen();
       setBootstrapStatus(undefined);
       setBootstrapMessage(undefined);
       setFileTabs([]);
@@ -1082,6 +1302,19 @@ export default function App() {
   }, [selectedThreadId]);
 
   useEffect(() => {
+    if (!quickOpenOpen) {
+      return;
+    }
+
+    setQuickOpenActiveIndex((prev) => {
+      if (quickOpenCandidates.length === 0) {
+        return 0;
+      }
+      return clampNumber(prev, 0, quickOpenCandidates.length - 1);
+    });
+  }, [quickOpenCandidates, quickOpenOpen]);
+
+  useEffect(() => {
     if (!selectedThreadId) {
       return;
     }
@@ -1114,6 +1347,7 @@ export default function App() {
     const onKeyDown = (event: KeyboardEvent) => {
       const mod = event.metaKey || event.ctrlKey;
       const key = event.key.toLowerCase();
+      const editable = isEditableTarget(event.target);
 
       if (mod && key === "s") {
         event.preventDefault();
@@ -1130,15 +1364,37 @@ export default function App() {
 
       if (mod && key === "p" && selectedThreadId) {
         event.preventDefault();
-        setCenterPaneMode("editor");
-        setQuickOpenQuery("");
-        setQuickOpenOpen(true);
+        void openQuickOpen();
         return;
       }
 
       if (quickOpenOpen && key === "escape") {
         event.preventDefault();
-        setQuickOpenOpen(false);
+        closeQuickOpen();
+        return;
+      }
+
+      if (!editable && mod && key === "b") {
+        event.preventDefault();
+        setShowLeftSidebar((prev) => !prev);
+        return;
+      }
+
+      if (!editable && mod && event.altKey && key === "b") {
+        event.preventDefault();
+        setShowRightPanel((prev) => !prev);
+        return;
+      }
+
+      if (!editable && mod && key === "e" && centerPaneMode === "editor") {
+        event.preventDefault();
+        setShowExplorer((prev) => !prev);
+        return;
+      }
+
+      if (!editable && mod && key === "0") {
+        event.preventDefault();
+        handleResetLayout();
         return;
       }
 
@@ -1160,14 +1416,14 @@ export default function App() {
         return;
       }
 
-      if (isEditableTarget(event.target)) {
+      if (editable) {
         return;
       }
     };
 
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [activeEditorTab, quickOpenOpen, selectedThreadId]);
+  }, [activeEditorTab, quickOpenOpen, selectedThreadId, centerPaneMode]);
 
   useEffect(() => {
     if (!lineJumpTarget || lineJumpTarget.path !== activeFilePath || !editorViewRef.current) {
@@ -1510,8 +1766,13 @@ export default function App() {
 
   return (
     <div className="h-screen w-screen overflow-hidden bg-background text-foreground">
-      <div className="grid h-full w-full grid-cols-[316px_minmax(0,1fr)]">
-        <aside className="flex h-full flex-col border-r border-border bg-muted/30 p-3">
+      <div className="flex h-full w-full">
+        {showLeftSidebar ? (
+          <>
+            <aside
+              style={{ width: `${leftSidebarWidth}px` }}
+              className="flex h-full shrink-0 flex-col border-r border-border bg-muted/30 p-3"
+            >
           <div className="mb-3 flex items-center justify-between rounded-lg bg-card px-3 py-2">
             <div className="flex items-center gap-2">
               <div className="rounded-md bg-primary/10 p-1.5 text-primary">
@@ -1688,7 +1949,7 @@ export default function App() {
             </Button>
           </div>
 
-          <ScrollArea className="min-h-0 flex-1 rounded-lg bg-card p-2">
+            <ScrollArea className="min-h-0 flex-1 rounded-lg bg-card p-2">
             {visibleThreads.map(({ thread, runs }) => {
               const latest = runs[0];
               const isSelected = thread.id === selectedThreadId;
@@ -1725,10 +1986,27 @@ export default function App() {
                 </button>
               );
             })}
-          </ScrollArea>
-        </aside>
+            </ScrollArea>
+            </aside>
 
-        <main className="flex min-w-0 flex-col">
+            <div
+              className="w-1 shrink-0 cursor-col-resize bg-border/40 hover:bg-primary/40"
+              onMouseDown={(event) => startResize("left", event.clientX)}
+            />
+          </>
+        ) : (
+          <div className="flex h-full w-10 shrink-0 items-start justify-center border-r border-border bg-muted/20 pt-3">
+            <button
+              className="rounded-md border border-border px-1.5 py-1 text-[11px] text-muted-foreground hover:bg-muted hover:text-foreground"
+              onClick={() => setShowLeftSidebar(true)}
+              title="Show sidebar (Ctrl/Cmd+B)"
+            >
+              &gt;
+            </button>
+          </div>
+        )}
+
+        <main className="flex min-h-0 min-w-0 flex-1 flex-col">
           <header className="drag-region border-b border-border bg-card px-4 py-3">
             <div className="flex items-center justify-between gap-3">
               <div className="min-w-0">
@@ -1806,40 +2084,77 @@ export default function App() {
                   <Button
                     variant="outline"
                     size="sm"
+                    className="h-8 w-8 p-0"
                     disabled={!selectedThreadId}
-                    onClick={() => {
-                      setCenterPaneMode("editor");
-                      setQuickOpenQuery("");
-                      setQuickOpenOpen(true);
-                    }}
+                    onClick={() => void openQuickOpen()}
+                    title="Quick open (Ctrl/Cmd+P)"
                   >
-                    Quick Open
-                    <span className="ml-2 rounded border border-border px-1.5 py-0.5 text-[10px] text-muted-foreground">
-                      Ctrl/Cmd+P
-                    </span>
+                    <Search className="h-4 w-4" />
                   </Button>
 
                   <Button
                     variant="outline"
                     size="sm"
+                    className="h-8 w-8 p-0"
+                    onClick={() => setShowLeftSidebar((prev) => !prev)}
+                    title="Toggle left sidebar (Ctrl/Cmd+B)"
+                  >
+                    <PanelLeft className={`h-4 w-4 ${showLeftSidebar ? "" : "text-muted-foreground"}`} />
+                  </Button>
+
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="h-8 w-8 p-0"
+                    disabled={centerPaneMode !== "editor"}
+                    onClick={() => setShowExplorer((prev) => !prev)}
+                    title="Toggle explorer (Ctrl/Cmd+E)"
+                  >
+                    <Folder className={`h-4 w-4 ${showExplorer ? "" : "text-muted-foreground"}`} />
+                  </Button>
+
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="h-8 w-8 p-0"
+                    onClick={() => setShowRightPanel((prev) => !prev)}
+                    title="Toggle right panel (Ctrl/Cmd+Alt+B)"
+                  >
+                    <PanelRight className={`h-4 w-4 ${showRightPanel ? "" : "text-muted-foreground"}`} />
+                  </Button>
+
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="h-8 w-8 p-0"
+                    onClick={handleResetLayout}
+                    title="Reset layout (Ctrl/Cmd+0)"
+                  >
+                    <RotateCcw className="h-4 w-4" />
+                  </Button>
+
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="h-8 w-8 p-0"
                     disabled={!selectedThreadId}
                     onClick={() => void handleOpenPrdQuickAction()}
+                    title="Open PRD"
                   >
-                    <FileText className="mr-1.5 h-4 w-4" />
-                    Open PRD
+                    <FileText className="h-4 w-4" />
                   </Button>
                   <Button
                     variant="outline"
                     size="sm"
+                    className="h-8 w-8 p-0"
                     disabled={!selectedThreadId || prdSaving}
                     onClick={handleCreatePrdQuickAction}
+                    title="Create PRD"
                   >
-                    <Plus className="mr-1.5 h-4 w-4" />
-                    Create PRD
+                    <Plus className="h-4 w-4" />
                   </Button>
-                  <Button variant="outline" size="sm" disabled>
-                    <GitBranch className="mr-1.5 h-4 w-4" />
-                    Create branch here
+                  <Button variant="outline" size="sm" className="h-8 w-8 p-0" disabled title="Create branch">
+                    <GitBranch className="h-4 w-4" />
                   </Button>
                 </div>
 
@@ -1880,8 +2195,8 @@ export default function App() {
             </div>
           </header>
 
-          <section className="grid min-h-0 flex-1 grid-cols-[minmax(0,1fr)_320px] bg-background">
-            <div className="flex min-h-0 flex-col">
+          <section className="flex min-h-0 flex-1 bg-background">
+            <div className="flex min-h-0 min-w-0 flex-1 flex-col">
               {centerPaneMode === "activity" ? (
                 <ScrollArea className="min-h-0 flex-1 px-6 py-5">
                   {events.length === 0 ? (
@@ -1917,112 +2232,145 @@ export default function App() {
                   )}
                 </ScrollArea>
               ) : (
-                <div className="grid min-h-0 flex-1 grid-cols-[280px_minmax(0,1fr)] border-b border-border">
-                  <aside className="flex min-h-0 flex-col border-r border-border bg-card/50">
-                    <div className="border-b border-border px-3 py-2">
-                      <div className="mb-2 flex items-center justify-between">
-                        <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-                          Explorer
-                        </p>
-                        <div className="flex items-center gap-1">
-                          <Button
-                            variant="ghost"
-                            size="sm"
-                            className="h-7 w-7 p-0"
-                            disabled={!selectedThreadId || workspaceCurrentPath === "." || workspaceLoading}
-                            onClick={() =>
-                              selectedThreadId &&
-                              void loadWorkspaceDirectory(selectedThreadId, dirname(workspaceCurrentPath))
-                            }
-                          >
-                            <ArrowUp className="h-3.5 w-3.5" />
-                          </Button>
-                          <Button
-                            variant="ghost"
-                            size="sm"
-                            className="h-7 w-7 p-0"
-                            disabled={!selectedThreadId || workspaceLoading}
-                            onClick={() =>
-                              selectedThreadId &&
-                              void loadWorkspaceDirectory(selectedThreadId, workspaceCurrentPath)
-                            }
-                          >
-                            <RefreshCw className="h-3.5 w-3.5" />
-                          </Button>
-                        </div>
-                      </div>
+                <div className="flex min-h-0 flex-1 border-b border-border">
+                  {showExplorer ? (
+                    <>
+                      <aside
+                        style={{ width: `${explorerWidth}px` }}
+                        className="flex min-h-0 shrink-0 flex-col border-r border-border bg-card/50"
+                      >
+                        <div className="border-b border-border px-3 py-2">
+                          <div className="mb-2 flex items-center justify-between">
+                            <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                              Explorer
+                            </p>
+                            <div className="flex items-center gap-1">
+                              <Button
+                                variant="ghost"
+                                size="sm"
+                                className="h-7 w-7 p-0"
+                                disabled={!selectedThreadId || workspaceCurrentPath === "." || workspaceLoading}
+                                onClick={() =>
+                                  selectedThreadId &&
+                                  void loadWorkspaceDirectory(selectedThreadId, dirname(workspaceCurrentPath))
+                                }
+                              >
+                                <ArrowUp className="h-3.5 w-3.5" />
+                              </Button>
+                              <Button
+                                variant="ghost"
+                                size="sm"
+                                className="h-7 w-7 p-0"
+                                disabled={!selectedThreadId || workspaceLoading}
+                                onClick={() =>
+                                  selectedThreadId &&
+                                  void loadWorkspaceDirectory(selectedThreadId, workspaceCurrentPath)
+                                }
+                              >
+                                <RefreshCw className="h-3.5 w-3.5" />
+                              </Button>
+                              <Button
+                                variant="ghost"
+                                size="sm"
+                                className="h-7 px-2 text-[11px]"
+                                onClick={() => setShowExplorer(false)}
+                                title="Hide explorer (Ctrl/Cmd+E)"
+                              >
+                                Hide
+                              </Button>
+                            </div>
+                          </div>
 
-                      <div className="flex flex-wrap items-center gap-1 text-[11px] text-muted-foreground">
-                        <button
-                          className="rounded bg-muted px-1.5 py-0.5 hover:bg-muted/70"
-                          onClick={() => selectedThreadId && void loadWorkspaceDirectory(selectedThreadId, ".")}
-                        >
-                          root
-                        </button>
-                        {workspacePathSegments.map((segment, index) => {
-                          const path = workspacePathSegments.slice(0, index + 1).join("/");
-                          return (
+                          <div className="flex flex-wrap items-center gap-1 text-[11px] text-muted-foreground">
                             <button
-                              key={`${segment}-${index}`}
                               className="rounded bg-muted px-1.5 py-0.5 hover:bg-muted/70"
                               onClick={() =>
-                                selectedThreadId && void loadWorkspaceDirectory(selectedThreadId, path)
+                                selectedThreadId && void loadWorkspaceDirectory(selectedThreadId, ".")
                               }
                             >
-                              {segment}
+                              root
                             </button>
-                          );
-                        })}
-                      </div>
-                      {workspaceRoot && (
-                        <p className="mt-1 truncate text-[10px] text-muted-foreground">{workspaceRoot}</p>
-                      )}
-                    </div>
-
-                    <ScrollArea className="min-h-0 flex-1 p-2">
-                      {workspaceError ? (
-                        <p className="text-xs text-rose-600">{workspaceError}</p>
-                      ) : workspaceLoading ? (
-                        <p className="text-xs text-muted-foreground">Loading files...</p>
-                      ) : workspaceEntries.length === 0 ? (
-                        <p className="text-xs text-muted-foreground">No files in this folder.</p>
-                      ) : (
-                        <div className="space-y-1">
-                          {workspaceEntries.map((entry) => (
-                            <button
-                              key={entry.path}
-                              className={`flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-xs hover:bg-muted ${
-                                entry.type === "file" && activeFilePath === entry.path
-                                  ? "bg-primary/10"
-                                  : ""
-                              }`}
-                              onClick={() => {
-                                if (!selectedThreadId) {
-                                  return;
-                                }
-
-                                if (entry.type === "directory") {
-                                  void loadWorkspaceDirectory(selectedThreadId, entry.path);
-                                  return;
-                                }
-
-                                void openWorkspaceFile(entry.path);
-                              }}
-                            >
-                              {entry.type === "directory" ? (
-                                <Folder className="h-3.5 w-3.5 text-sky-500" />
-                              ) : (
-                                <File className="h-3.5 w-3.5 text-muted-foreground" />
-                              )}
-                              <span className="truncate">{entry.name}</span>
-                            </button>
-                          ))}
+                            {workspacePathSegments.map((segment, index) => {
+                              const path = workspacePathSegments.slice(0, index + 1).join("/");
+                              return (
+                                <button
+                                  key={`${segment}-${index}`}
+                                  className="rounded bg-muted px-1.5 py-0.5 hover:bg-muted/70"
+                                  onClick={() =>
+                                    selectedThreadId && void loadWorkspaceDirectory(selectedThreadId, path)
+                                  }
+                                >
+                                  {segment}
+                                </button>
+                              );
+                            })}
+                          </div>
+                          {workspaceRoot && (
+                            <p className="mt-1 truncate text-[10px] text-muted-foreground">{workspaceRoot}</p>
+                          )}
                         </div>
-                      )}
-                    </ScrollArea>
-                  </aside>
 
-                  <div className="flex min-h-0 flex-col">
+                        <ScrollArea className="min-h-0 flex-1 p-2">
+                          {workspaceError ? (
+                            <p className="text-xs text-rose-600">{workspaceError}</p>
+                          ) : workspaceLoading ? (
+                            <p className="text-xs text-muted-foreground">Loading files...</p>
+                          ) : workspaceEntries.length === 0 ? (
+                            <p className="text-xs text-muted-foreground">No files in this folder.</p>
+                          ) : (
+                            <div className="space-y-1">
+                              {workspaceEntries.map((entry) => (
+                                <button
+                                  key={entry.path}
+                                  className={`flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-xs hover:bg-muted ${
+                                    entry.type === "file" && activeFilePath === entry.path
+                                      ? "bg-primary/10"
+                                      : ""
+                                  }`}
+                                  onClick={() => {
+                                    if (!selectedThreadId) {
+                                      return;
+                                    }
+
+                                    if (entry.type === "directory") {
+                                      void loadWorkspaceDirectory(selectedThreadId, entry.path);
+                                      return;
+                                    }
+
+                                    void openWorkspaceFile(entry.path);
+                                  }}
+                                >
+                                  {entry.type === "directory" ? (
+                                    <Folder className="h-3.5 w-3.5 text-sky-500" />
+                                  ) : (
+                                    <File className="h-3.5 w-3.5 text-muted-foreground" />
+                                  )}
+                                  <span className="truncate">{entry.name}</span>
+                                </button>
+                              ))}
+                            </div>
+                          )}
+                        </ScrollArea>
+                      </aside>
+
+                      <div
+                        className="w-1 shrink-0 cursor-col-resize bg-border/40 hover:bg-primary/40"
+                        onMouseDown={(event) => startResize("explorer", event.clientX)}
+                      />
+                    </>
+                  ) : (
+                    <div className="flex w-8 shrink-0 items-start justify-center border-r border-border bg-card/40 pt-2">
+                      <button
+                        className="rounded border border-border px-1 py-0.5 text-[11px] text-muted-foreground hover:bg-muted hover:text-foreground"
+                        onClick={() => setShowExplorer(true)}
+                        title="Show explorer (Ctrl/Cmd+E)"
+                      >
+                        &gt;
+                      </button>
+                    </div>
+                  )}
+
+                  <div className="flex min-h-0 min-w-0 flex-1 flex-col">
                     <div className="flex items-center justify-between border-b border-border px-2 py-1.5">
                       <div className="flex min-w-0 items-center gap-1 overflow-x-auto">
                         {fileTabs.length === 0 ? (
@@ -2217,7 +2565,16 @@ export default function App() {
               </div>
             </div>
 
-            <aside className="flex min-h-0 flex-col border-l border-border bg-card/80 p-4">
+            {showRightPanel ? (
+              <>
+                <div
+                  className="w-1 shrink-0 cursor-col-resize bg-border/40 hover:bg-primary/40"
+                  onMouseDown={(event) => startResize("right", event.clientX)}
+                />
+                <aside
+                  style={{ width: `${rightPanelWidth}px` }}
+                  className="flex min-h-0 shrink-0 flex-col border-l border-border bg-card/80 p-4"
+                >
               <div className="mb-3 grid grid-cols-3 gap-2 rounded-lg bg-muted p-1">
                 <button
                   className={`rounded-md px-2 py-1 text-xs font-medium ${
@@ -2575,11 +2932,23 @@ export default function App() {
                 </>
               )}
 
-              <div className="mt-4 rounded-lg border border-border bg-background px-3 py-2 text-xs text-muted-foreground">
-                {loading ? "Refreshing data..." : "Ready"}
-                {error ? ` - ${error}` : ""}
+                  <div className="mt-4 rounded-lg border border-border bg-background px-3 py-2 text-xs text-muted-foreground">
+                    {loading ? "Refreshing data..." : "Ready"}
+                    {error ? ` - ${error}` : ""}
+                  </div>
+                </aside>
+              </>
+            ) : (
+              <div className="flex w-10 shrink-0 items-start justify-center border-l border-border bg-card/40 pt-3">
+                <button
+                  className="rounded border border-border px-1.5 py-1 text-[11px] text-muted-foreground hover:bg-muted hover:text-foreground"
+                  onClick={() => setShowRightPanel(true)}
+                  title="Show right panel (Ctrl/Cmd+Alt+B)"
+                >
+                  &lt;
+                </button>
               </div>
-            </aside>
+            )}
           </section>
         </main>
 
@@ -2587,7 +2956,7 @@ export default function App() {
           <div
             className="fixed inset-0 z-40 flex items-start justify-center bg-black/35 p-6"
             role="dialog"
-            onClick={() => setQuickOpenOpen(false)}
+            onClick={closeQuickOpen}
           >
             <div
               className="mt-16 w-full max-w-2xl rounded-lg border border-border bg-card shadow-2xl"
@@ -2598,32 +2967,85 @@ export default function App() {
                   autoFocus
                   placeholder="Quick open file..."
                   value={quickOpenQuery}
-                  onChange={(event) => setQuickOpenQuery(event.target.value)}
+                  onChange={(event) => {
+                    setQuickOpenQuery(event.target.value);
+                    setQuickOpenActiveIndex(0);
+                  }}
                   onKeyDown={(event) => {
+                    if (event.key === "ArrowDown") {
+                      event.preventDefault();
+                      if (quickOpenCandidates.length > 0) {
+                        setQuickOpenActiveIndex((prev) =>
+                          clampNumber(prev + 1, 0, quickOpenCandidates.length - 1)
+                        );
+                      }
+                      return;
+                    }
+
+                    if (event.key === "ArrowUp") {
+                      event.preventDefault();
+                      if (quickOpenCandidates.length > 0) {
+                        setQuickOpenActiveIndex((prev) =>
+                          clampNumber(prev - 1, 0, quickOpenCandidates.length - 1)
+                        );
+                      }
+                      return;
+                    }
+
+                    if (event.key === "Escape") {
+                      event.preventDefault();
+                      closeQuickOpen();
+                      return;
+                    }
+
                     if (event.key === "Enter" && quickOpenCandidates.length > 0) {
                       event.preventDefault();
-                      void openWorkspaceFile(quickOpenCandidates[0]);
-                      setQuickOpenOpen(false);
+                      const selectedPath = quickOpenCandidates[quickOpenActiveIndex] ?? quickOpenCandidates[0];
+                      openQuickOpenCandidate(selectedPath);
                     }
                   }}
                 />
-                <p className="mt-2 text-[11px] text-muted-foreground">
-                  Enter to open first match. Esc to close.
-                </p>
+                <div className="mt-2 flex items-center justify-between gap-2">
+                  <p className="text-[11px] text-muted-foreground">Enter to open first match. Esc to close.</p>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="h-6 px-2 text-[11px]"
+                    disabled={!selectedThreadId || quickOpenLoading}
+                    onClick={() => {
+                      if (!selectedThreadId) {
+                        return;
+                      }
+                      setQuickOpenLoading(true);
+                      void loadWorkspaceFileIndex(selectedThreadId).finally(() => {
+                        setQuickOpenLoading(false);
+                      });
+                    }}
+                  >
+                    {quickOpenLoading ? "Indexing..." : "Refresh index"}
+                  </Button>
+                </div>
+                {quickOpenError && <p className="mt-1 text-[11px] text-amber-600">{quickOpenError}</p>}
               </div>
 
               <ScrollArea className="h-[340px] p-2">
-                {quickOpenCandidates.length === 0 ? (
-                  <p className="p-2 text-xs text-muted-foreground">No matching files.</p>
+                {quickOpenLoading ? (
+                  <p className="p-2 text-xs text-muted-foreground">Building file index...</p>
+                ) : quickOpenCandidates.length === 0 ? (
+                  <p className="p-2 text-xs text-muted-foreground">
+                    {workspaceFileIndex.length === 0
+                      ? "No indexed files yet. Try Refresh index."
+                      : "No matching files."}
+                  </p>
                 ) : (
-                  quickOpenCandidates.map((path) => (
+                  quickOpenCandidates.map((path, index) => (
                     <button
                       key={path}
-                      className="mb-1 flex w-full items-center justify-between rounded-md px-2 py-1.5 text-left text-xs hover:bg-muted"
-                      onClick={() => {
-                        void openWorkspaceFile(path);
-                        setQuickOpenOpen(false);
-                      }}
+                      className={`mb-1 flex w-full items-center justify-between rounded-md px-2 py-1.5 text-left text-xs hover:bg-muted ${
+                        index === quickOpenActiveIndex ? "bg-primary/10" : ""
+                      }`}
+                      onMouseEnter={() => setQuickOpenActiveIndex(index)}
+                      onClick={() => openQuickOpenCandidate(path)}
                     >
                       <span className="truncate">{path}</span>
                       {activeFilePath === path && <Badge variant="info">open</Badge>}
