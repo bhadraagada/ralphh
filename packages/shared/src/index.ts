@@ -13,6 +13,8 @@ export type EventType =
   | "thread.worktree.created"
   | "review.comment.created"
   | "review.rerun.queued"
+  | "automation.created"
+  | "automation.triggered"
   | "run.queued"
   | "run.started"
   | "run.paused"
@@ -107,4 +109,24 @@ export interface CreateReviewCommentRequest {
 
 export interface FeedbackRerunRequest {
   commentIds: number[];
+}
+
+export interface AutomationRecord {
+  id: string;
+  name: string;
+  cron: string;
+  threadId: string;
+  maxIterations: number;
+  enabled: boolean;
+  lastRunAt?: number;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface CreateAutomationRequest {
+  name: string;
+  cron: string;
+  threadId: string;
+  maxIterations?: number;
+  enabled?: boolean;
 }
