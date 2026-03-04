@@ -1,7 +1,10 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
+  ArrowUp,
   Bot,
   ChevronDown,
+  File,
+  FileText,
   Circle,
   CircleDot,
   CirclePlay,
@@ -28,13 +31,25 @@ import type {
   AutomationRecord,
   BroadcastEnvelope,
   EventRecord,
+  ListWorkspaceFilesResponse,
   PrdDocumentRecord,
   PrdFormat,
+  RalphBootstrapResult,
+  RalphBootstrapStatus,
+  ReadWorkspaceFileResponse,
   ReviewCommentRecord,
   RunRecord,
   RunStatus,
   ThreadRecord,
+  WorkspaceFileEntryRecord,
 } from "@ralphh/shared";
+import type { Extension } from "@codemirror/state";
+import { EditorView } from "@codemirror/view";
+import { javascript } from "@codemirror/lang-javascript";
+import { json as jsonLanguage } from "@codemirror/lang-json";
+import { markdown } from "@codemirror/lang-markdown";
+import { oneDark } from "@codemirror/theme-one-dark";
+import CodeMirror from "@uiw/react-codemirror";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -52,6 +67,12 @@ interface DiffLine {
   type: "meta" | "add" | "remove" | "context";
   filePath?: string;
   lineNumber?: number;
+}
+
+interface FileEditorTab {
+  path: string;
+  content: string;
+  savedContent: string;
 }
 
 type ThemeMode = "light" | "dark";
@@ -95,6 +116,76 @@ Describe the first deliverable.
 function defaultPrdTemplate(format: PrdFormat): string {
   return format === "json" ? DEFAULT_PRD_JSON : DEFAULT_PRD_MARKDOWN;
 }
+
+function dirname(path: string): string {
+  const normalized = path.replace(/\\/g, "/").replace(/^\/+/, "");
+  if (!normalized || normalized === ".") {
+    return ".";
+  }
+
+  const segments = normalized.split("/").filter(Boolean);
+  segments.pop();
+  return segments.length === 0 ? "." : segments.join("/");
+}
+
+function languageExtensionsForPath(path: string): Extension[] {
+  const normalized = path.toLowerCase();
+
+  if (normalized.endsWith(".md") || normalized.endsWith(".markdown")) {
+    return [markdown()];
+  }
+
+  if (normalized.endsWith(".json")) {
+    return [jsonLanguage()];
+  }
+
+  if (normalized.endsWith(".tsx")) {
+    return [javascript({ typescript: true, jsx: true })];
+  }
+
+  if (normalized.endsWith(".ts")) {
+    return [javascript({ typescript: true })];
+  }
+
+  if (normalized.endsWith(".jsx")) {
+    return [javascript({ jsx: true })];
+  }
+
+  if (normalized.endsWith(".js") || normalized.endsWith(".mjs") || normalized.endsWith(".cjs")) {
+    return [javascript()];
+  }
+
+  return [];
+}
+
+const editorSurfaceTheme = EditorView.theme({
+  "&": {
+    height: "100%",
+    backgroundColor: "oklch(var(--card))",
+    color: "oklch(var(--foreground))",
+  },
+  ".cm-scroller": {
+    backgroundColor: "oklch(var(--card))",
+    fontFamily: '"SF Mono", Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace',
+  },
+  ".cm-content": {
+    caretColor: "oklch(var(--foreground))",
+  },
+  ".cm-gutters": {
+    backgroundColor: "oklch(var(--card))",
+    color: "oklch(var(--muted-foreground))",
+    borderRight: "1px solid oklch(var(--border))",
+  },
+  ".cm-activeLine": {
+    backgroundColor: "oklch(var(--muted) / 0.42)",
+  },
+  ".cm-activeLineGutter": {
+    backgroundColor: "oklch(var(--muted) / 0.42)",
+  },
+  "&.cm-focused": {
+    outline: "none",
+  },
+});
 
 function formatTime(ts?: number): string {
   if (!ts) {
@@ -279,7 +370,7 @@ export default function App() {
   const [events, setEvents] = useState<EventRecord[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | undefined>();
-  const [theme, setTheme] = useState<ThemeMode>("light");
+  const [theme, setTheme] = useState<ThemeMode>("dark");
 
   const [showCreateThread, setShowCreateThread] = useState(false);
   const [showAutomations, setShowAutomations] = useState(false);
@@ -292,6 +383,7 @@ export default function App() {
 
   const [workspaceDropdownOpen, setWorkspaceDropdownOpen] = useState(false);
   const [selectedWorkspace, setSelectedWorkspace] = useState<string>("all");
+  const [centerPaneMode, setCenterPaneMode] = useState<"activity" | "editor">("activity");
   const [composerText, setComposerText] = useState("");
   const [isWindowMaximized, setIsWindowMaximized] = useState(false);
   const [rightPanelTab, setRightPanelTab] = useState<"controls" | "review" | "plan">("controls");
@@ -309,6 +401,22 @@ export default function App() {
   });
   const [prdLoading, setPrdLoading] = useState(false);
   const [prdSaving, setPrdSaving] = useState(false);
+  const [bootstrapStatus, setBootstrapStatus] = useState<RalphBootstrapStatus | undefined>();
+  const [bootstrapLoading, setBootstrapLoading] = useState(false);
+  const [bootstrapInitializing, setBootstrapInitializing] = useState(false);
+  const [bootstrapMessage, setBootstrapMessage] = useState<string | undefined>();
+  const [workspaceRoot, setWorkspaceRoot] = useState("");
+  const [workspaceCurrentPath, setWorkspaceCurrentPath] = useState(".");
+  const [workspaceEntries, setWorkspaceEntries] = useState<WorkspaceFileEntryRecord[]>([]);
+  const [workspaceLoading, setWorkspaceLoading] = useState(false);
+  const [workspaceError, setWorkspaceError] = useState<string | undefined>();
+  const [fileTabs, setFileTabs] = useState<FileEditorTab[]>([]);
+  const [activeFilePath, setActiveFilePath] = useState<string | undefined>();
+  const [editorLoadingPath, setEditorLoadingPath] = useState<string | undefined>();
+  const [editorSavingPath, setEditorSavingPath] = useState<string | undefined>();
+  const [lineJumpTarget, setLineJumpTarget] = useState<{ path: string; lineNumber: number }>();
+  const editorViewRef = useRef<EditorView | null>(null);
+  const [editorVersion, setEditorVersion] = useState(0);
 
   const workspaces = useMemo(
     () => Array.from(new Set(threads.map((bundle) => bundle.thread.repoPath))),
@@ -341,6 +449,18 @@ export default function App() {
   const windowControls = window.ralphDesktop?.windowControls;
   const hasNativeWindowControls = Boolean(windowControls);
   const diffLines = useMemo(() => parseUnifiedDiff(diffText), [diffText]);
+  const activeEditorTab = useMemo(
+    () => fileTabs.find((tab) => tab.path === activeFilePath),
+    [fileTabs, activeFilePath]
+  );
+  const dirtyTabCount = useMemo(
+    () => fileTabs.filter((tab) => tab.content !== tab.savedContent).length,
+    [fileTabs]
+  );
+  const workspacePathSegments = useMemo(
+    () => workspaceCurrentPath.split("/").filter(Boolean),
+    [workspaceCurrentPath]
+  );
 
   useEffect(() => {
     const storedTheme = localStorage.getItem("ralph-theme");
@@ -432,11 +552,12 @@ export default function App() {
     }
   }
 
-  async function loadPrd(threadId: string): Promise<void> {
+  async function loadPrd(threadId: string): Promise<PrdDocumentRecord | undefined> {
     setPrdLoading(true);
     try {
       const data = await getJson<{ prd: PrdDocumentRecord }>(`/threads/${threadId}/prd`);
       setPrd(data.prd);
+      return data.prd;
     } catch (loadError) {
       setPrd({
         exists: false,
@@ -445,9 +566,275 @@ export default function App() {
         content: "",
       });
       setError(loadError instanceof Error ? loadError.message : String(loadError));
+      return undefined;
     } finally {
       setPrdLoading(false);
     }
+  }
+
+  async function loadBootstrapStatus(threadId: string): Promise<void> {
+    setBootstrapLoading(true);
+    try {
+      const data = await getJson<{ status: RalphBootstrapStatus }>(`/threads/${threadId}/bootstrap`);
+      setBootstrapStatus(data.status);
+    } catch (loadError) {
+      setBootstrapStatus(undefined);
+      setError(loadError instanceof Error ? loadError.message : String(loadError));
+    } finally {
+      setBootstrapLoading(false);
+    }
+  }
+
+  async function handleInitializeRalphWorkspace(): Promise<void> {
+    if (!selectedThreadId) {
+      return;
+    }
+
+    setBootstrapInitializing(true);
+    try {
+      const data = await postJson<RalphBootstrapResult>(`/threads/${selectedThreadId}/bootstrap/init`, {});
+      setBootstrapStatus(data.status);
+      if (data.created.length > 0) {
+        setBootstrapMessage(`Initialized: ${data.created.join(", ")}`);
+      } else {
+        setBootstrapMessage("Already initialized. No new files were created.");
+      }
+
+      await Promise.all([
+        loadPrd(selectedThreadId),
+        loadWorkspaceDirectory(selectedThreadId, "."),
+        loadThreads(),
+      ]);
+      setError(undefined);
+    } catch (initError) {
+      const message = initError instanceof Error ? initError.message : String(initError);
+      setError(message);
+      setBootstrapMessage(undefined);
+    } finally {
+      setBootstrapInitializing(false);
+    }
+  }
+
+  async function loadWorkspaceDirectory(threadId: string, path = "."): Promise<void> {
+    setWorkspaceLoading(true);
+    setWorkspaceError(undefined);
+    try {
+      const suffix = path === "." ? "" : `?path=${encodeURIComponent(path)}`;
+      const data = await getJson<ListWorkspaceFilesResponse>(`/threads/${threadId}/files${suffix}`);
+      setWorkspaceRoot(data.root);
+      setWorkspaceCurrentPath(data.currentPath);
+      setWorkspaceEntries(data.entries);
+    } catch (loadError) {
+      const message = loadError instanceof Error ? loadError.message : String(loadError);
+      setWorkspaceError(message);
+    } finally {
+      setWorkspaceLoading(false);
+    }
+  }
+
+  async function openWorkspaceFile(
+    filePath: string,
+    options: { forceReload?: boolean; lineNumber?: number } = {}
+  ): Promise<void> {
+    if (!selectedThreadId) {
+      return;
+    }
+
+    const existing = fileTabs.find((tab) => tab.path === filePath);
+    if (existing && !options.forceReload) {
+      setActiveFilePath(filePath);
+      if (options.lineNumber) {
+        setLineJumpTarget({ path: filePath, lineNumber: options.lineNumber });
+      }
+      return;
+    }
+
+    setCenterPaneMode("editor");
+    setEditorLoadingPath(filePath);
+    try {
+      const data = await getJson<{ file?: ReadWorkspaceFileResponse } & Partial<ReadWorkspaceFileResponse>>(
+        `/threads/${selectedThreadId}/files/read?path=${encodeURIComponent(filePath)}`
+      );
+      const file = data.file ?? {
+        path: data.path ?? filePath,
+        content: data.content ?? "",
+      };
+
+      setFileTabs((prev) => {
+        const index = prev.findIndex((tab) => tab.path === file.path);
+        if (index === -1) {
+          return [
+            ...prev,
+            {
+              path: file.path,
+              content: file.content,
+              savedContent: file.content,
+            },
+          ];
+        }
+
+        const next = [...prev];
+        next[index] = {
+          ...next[index],
+          content: file.content,
+          savedContent: file.content,
+        };
+        return next;
+      });
+
+      setActiveFilePath(file.path);
+      setWorkspaceError(undefined);
+      if (options.lineNumber) {
+        setLineJumpTarget({ path: file.path, lineNumber: options.lineNumber });
+      }
+    } catch (loadError) {
+      const message = loadError instanceof Error ? loadError.message : String(loadError);
+      setWorkspaceError(message);
+      setError(message);
+    } finally {
+      setEditorLoadingPath(undefined);
+    }
+  }
+
+  function handleUpdateActiveFile(content: string): void {
+    if (!activeFilePath) {
+      return;
+    }
+
+    setFileTabs((prev) =>
+      prev.map((tab) => (tab.path === activeFilePath ? { ...tab, content } : tab))
+    );
+  }
+
+  async function handleSaveFile(filePath: string): Promise<void> {
+    if (!selectedThreadId) {
+      return;
+    }
+
+    const tab = fileTabs.find((item) => item.path === filePath);
+    if (!tab || tab.content === tab.savedContent) {
+      return;
+    }
+
+    setEditorSavingPath(filePath);
+    try {
+      const data = await postJson<{ file?: ReadWorkspaceFileResponse } & Partial<ReadWorkspaceFileResponse>>(
+        `/threads/${selectedThreadId}/files/write`,
+        {
+          path: tab.path,
+          content: tab.content,
+        }
+      );
+
+      const file = data.file ?? {
+        path: data.path ?? tab.path,
+        content: data.content ?? tab.content,
+      };
+
+      setFileTabs((prev) =>
+        prev.map((item) =>
+          item.path === file.path
+            ? { ...item, content: file.content, savedContent: file.content }
+            : item
+        )
+      );
+
+      if (prd.path === file.path) {
+        setPrd((prev) => ({
+          ...prev,
+          exists: true,
+          content: file.content,
+          validationError: undefined,
+        }));
+      }
+
+      setError(undefined);
+      await loadWorkspaceDirectory(selectedThreadId, dirname(file.path));
+      await loadBootstrapStatus(selectedThreadId);
+    } catch (saveError) {
+      const message = saveError instanceof Error ? saveError.message : String(saveError);
+      setError(message);
+      setWorkspaceError(message);
+    } finally {
+      setEditorSavingPath(undefined);
+    }
+  }
+
+  async function handleReloadFile(filePath: string): Promise<void> {
+    const tab = fileTabs.find((item) => item.path === filePath);
+    if (!tab) {
+      return;
+    }
+
+    if (tab.content !== tab.savedContent) {
+      const confirmed = window.confirm("Discard unsaved changes and reload this file?");
+      if (!confirmed) {
+        return;
+      }
+    }
+
+    await openWorkspaceFile(filePath, { forceReload: true });
+  }
+
+  async function handleSaveAllFiles(): Promise<void> {
+    const dirtyTabs = fileTabs.filter((tab) => tab.content !== tab.savedContent);
+    for (const tab of dirtyTabs) {
+      await handleSaveFile(tab.path);
+    }
+  }
+
+  function handleCloseFileTab(filePath: string): void {
+    const tab = fileTabs.find((item) => item.path === filePath);
+    if (!tab) {
+      return;
+    }
+
+    if (tab.content !== tab.savedContent) {
+      const confirmed = window.confirm(`Close ${filePath} without saving?`);
+      if (!confirmed) {
+        return;
+      }
+    }
+
+    const index = fileTabs.findIndex((item) => item.path === filePath);
+    const nextTabs = fileTabs.filter((item) => item.path !== filePath);
+    setFileTabs(nextTabs);
+
+    if (activeFilePath === filePath) {
+      const fallback = nextTabs[index] ?? nextTabs[index - 1];
+      setActiveFilePath(fallback?.path);
+    }
+  }
+
+  async function handleOpenFileAtLine(filePath: string, lineNumber: number): Promise<void> {
+    setCenterPaneMode("editor");
+    await openWorkspaceFile(filePath, { lineNumber });
+  }
+
+  async function handleOpenPrdQuickAction(): Promise<void> {
+    setRightPanelTab("plan");
+    if (selectedThreadId) {
+      const latestPrd = await loadPrd(selectedThreadId);
+      if (latestPrd?.exists && latestPrd.path) {
+        setCenterPaneMode("editor");
+        await openWorkspaceFile(latestPrd.path);
+      }
+    }
+  }
+
+  function handleCreatePrdQuickAction(): void {
+    setRightPanelTab("plan");
+    if (!selectedThreadId) {
+      return;
+    }
+
+    if (prd.exists && prd.path) {
+      setCenterPaneMode("editor");
+      void openWorkspaceFile(prd.path);
+      return;
+    }
+
+    void handleCreatePrd("json");
   }
 
   useEffect(() => {
@@ -460,6 +847,15 @@ export default function App() {
       setEvents([]);
       setDiffText("");
       setComments([]);
+      setWorkspaceRoot("");
+      setWorkspaceCurrentPath(".");
+      setWorkspaceEntries([]);
+      setWorkspaceError(undefined);
+      setBootstrapStatus(undefined);
+      setBootstrapMessage(undefined);
+      setFileTabs([]);
+      setActiveFilePath(undefined);
+      setLineJumpTarget(undefined);
       setPrd({
         exists: false,
         format: null,
@@ -475,10 +871,37 @@ export default function App() {
     void loadDiff(selectedThreadId);
     void loadComments(selectedThreadId);
     void loadPrd(selectedThreadId);
+    void loadBootstrapStatus(selectedThreadId);
+    void loadWorkspaceDirectory(selectedThreadId, ".");
     setSelectedDiffLine(undefined);
     setCommentBody("");
     setSelectedCommentIds([]);
+    setBootstrapMessage(undefined);
+    setFileTabs([]);
+    setActiveFilePath(undefined);
+    setLineJumpTarget(undefined);
   }, [selectedThreadId]);
+
+  useEffect(() => {
+    if (!lineJumpTarget || lineJumpTarget.path !== activeFilePath || !editorViewRef.current) {
+      return;
+    }
+
+    const view = editorViewRef.current;
+    const lineCount = view.state.doc.lines;
+    if (lineCount <= 0) {
+      return;
+    }
+
+    const lineNumber = Math.max(1, Math.min(lineJumpTarget.lineNumber, lineCount));
+    const line = view.state.doc.line(lineNumber);
+    view.dispatch({
+      selection: { anchor: line.from },
+      effects: EditorView.scrollIntoView(line.from, { y: "center" }),
+    });
+    view.focus();
+    setLineJumpTarget(undefined);
+  }, [lineJumpTarget, activeFilePath, fileTabs, editorVersion]);
 
   useEffect(() => {
     const socket = new WebSocket(`${API_BASE.replace("http", "ws")}/ws`);
@@ -652,11 +1075,39 @@ export default function App() {
       });
       setPrd(created.prd);
       setRightPanelTab("plan");
+      if (created.prd.path) {
+        setCenterPaneMode("editor");
+        await loadWorkspaceDirectory(selectedThreadId, dirname(created.prd.path));
+        await openWorkspaceFile(created.prd.path, { forceReload: true });
+      }
+      await loadBootstrapStatus(selectedThreadId);
       setError(undefined);
     } catch (saveError) {
       setError(saveError instanceof Error ? saveError.message : String(saveError));
     } finally {
       setPrdSaving(false);
+    }
+  }
+
+  async function handlePickRepoPath(): Promise<void> {
+    const picker = window.ralphDesktop?.pickDirectory;
+    if (!picker) {
+      setError("Folder picker is available in desktop mode.");
+      return;
+    }
+
+    try {
+      const selectedPath = await picker({
+        title: "Select repository folder",
+        defaultPath: newThreadRepo || undefined,
+      });
+
+      if (selectedPath) {
+        setNewThreadRepo(selectedPath);
+        setError(undefined);
+      }
+    } catch (pickError) {
+      setError(pickError instanceof Error ? pickError.message : String(pickError));
     }
   }
 
@@ -678,6 +1129,16 @@ export default function App() {
         path: prd.path ?? undefined,
       });
       setPrd(saved.prd);
+      if (saved.prd.path) {
+        setFileTabs((prev) =>
+          prev.map((tab) =>
+            tab.path === saved.prd.path
+              ? { ...tab, content: saved.prd.content, savedContent: saved.prd.content }
+              : tab
+          )
+        );
+      }
+      await loadBootstrapStatus(selectedThreadId);
       setError(undefined);
     } catch (saveError) {
       setError(saveError instanceof Error ? saveError.message : String(saveError));
@@ -818,11 +1279,16 @@ export default function App() {
                   value={newThreadName}
                   onChange={(event) => setNewThreadName(event.target.value)}
                 />
-                <Input
-                  placeholder="Repo path"
-                  value={newThreadRepo}
-                  onChange={(event) => setNewThreadRepo(event.target.value)}
-                />
+                <div className="flex items-center gap-2">
+                  <Input
+                    placeholder="Repo path"
+                    value={newThreadRepo}
+                    onChange={(event) => setNewThreadRepo(event.target.value)}
+                  />
+                  <Button type="button" variant="outline" onClick={() => void handlePickRepoPath()}>
+                    Browse
+                  </Button>
+                </div>
                 <Textarea
                   placeholder="What should this thread build?"
                   value={newThreadTask}
@@ -989,6 +1455,25 @@ export default function App() {
 
               <div className="no-drag flex items-center gap-2">
                 <div className="flex items-center gap-2">
+                  <div className="rounded-md border border-border bg-background p-0.5">
+                    <button
+                      className={`rounded px-2 py-1 text-xs ${
+                        centerPaneMode === "activity" ? "bg-muted text-foreground" : "text-muted-foreground"
+                      }`}
+                      onClick={() => setCenterPaneMode("activity")}
+                    >
+                      Activity
+                    </button>
+                    <button
+                      className={`rounded px-2 py-1 text-xs ${
+                        centerPaneMode === "editor" ? "bg-muted text-foreground" : "text-muted-foreground"
+                      }`}
+                      onClick={() => setCenterPaneMode("editor")}
+                    >
+                      Editor
+                    </button>
+                  </div>
+
                   <div className="relative">
                     <Button
                       variant="outline"
@@ -1026,11 +1511,23 @@ export default function App() {
                     )}
                   </div>
 
-                  <Button variant="outline" size="sm" disabled>
-                    Open
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    disabled={!selectedThreadId}
+                    onClick={() => void handleOpenPrdQuickAction()}
+                  >
+                    <FileText className="mr-1.5 h-4 w-4" />
+                    Open PRD
                   </Button>
-                  <Button variant="outline" size="sm" disabled>
-                    Checkout on local
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    disabled={!selectedThreadId || prdSaving}
+                    onClick={handleCreatePrdQuickAction}
+                  >
+                    <Plus className="mr-1.5 h-4 w-4" />
+                    Create PRD
                   </Button>
                   <Button variant="outline" size="sm" disabled>
                     <GitBranch className="mr-1.5 h-4 w-4" />
@@ -1077,39 +1574,262 @@ export default function App() {
 
           <section className="grid min-h-0 flex-1 grid-cols-[minmax(0,1fr)_320px] bg-background">
             <div className="flex min-h-0 flex-col">
-              <ScrollArea className="min-h-0 flex-1 px-6 py-5">
-                {events.length === 0 ? (
-                  <div className="mx-auto mt-24 max-w-xl text-center">
-                    <div className="mx-auto mb-4 flex h-12 w-12 items-center justify-center rounded-full bg-primary/10 text-primary">
-                      <Bot className="h-5 w-5" />
-                    </div>
-                    <p className="mb-2 text-lg font-medium">Let&apos;s build</p>
-                    <p className="text-sm text-muted-foreground">
-                      Start a run to see search, edit, validate, and checkpoint events stream in.
-                    </p>
-                  </div>
-                ) : (
-                  <div className="mx-auto max-w-3xl space-y-2">
-                    {events.map((event) => (
-                      <div
-                        key={event.id}
-                        className="rounded-lg border border-border bg-card px-3 py-2.5"
-                      >
-                        <div className="mb-1 flex items-center justify-between">
-                          <p className="text-sm font-medium">{eventLabel(event)}</p>
-                          <span className="text-xs text-muted-foreground">
-                            {formatTime(event.createdAt)}
-                          </span>
-                        </div>
-                        <p className="mb-1 text-[11px] text-muted-foreground">{event.type}</p>
-                        <pre className="overflow-x-auto whitespace-pre-wrap text-[11px] leading-5 text-muted-foreground">
-                          {JSON.stringify(event.payload, null, 2)}
-                        </pre>
+              {centerPaneMode === "activity" ? (
+                <ScrollArea className="min-h-0 flex-1 px-6 py-5">
+                  {events.length === 0 ? (
+                    <div className="mx-auto mt-24 max-w-xl text-center">
+                      <div className="mx-auto mb-4 flex h-12 w-12 items-center justify-center rounded-full bg-primary/10 text-primary">
+                        <Bot className="h-5 w-5" />
                       </div>
-                    ))}
+                      <p className="mb-2 text-lg font-medium">Let&apos;s build</p>
+                      <p className="text-sm text-muted-foreground">
+                        Start a run to see search, edit, validate, and checkpoint events stream in.
+                      </p>
+                    </div>
+                  ) : (
+                    <div className="mx-auto max-w-3xl space-y-2">
+                      {events.map((event) => (
+                        <div
+                          key={event.id}
+                          className="rounded-lg border border-border bg-card px-3 py-2.5"
+                        >
+                          <div className="mb-1 flex items-center justify-between">
+                            <p className="text-sm font-medium">{eventLabel(event)}</p>
+                            <span className="text-xs text-muted-foreground">
+                              {formatTime(event.createdAt)}
+                            </span>
+                          </div>
+                          <p className="mb-1 text-[11px] text-muted-foreground">{event.type}</p>
+                          <pre className="overflow-x-auto whitespace-pre-wrap text-[11px] leading-5 text-muted-foreground">
+                            {JSON.stringify(event.payload, null, 2)}
+                          </pre>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </ScrollArea>
+              ) : (
+                <div className="grid min-h-0 flex-1 grid-cols-[280px_minmax(0,1fr)] border-b border-border">
+                  <aside className="flex min-h-0 flex-col border-r border-border bg-card/50">
+                    <div className="border-b border-border px-3 py-2">
+                      <div className="mb-2 flex items-center justify-between">
+                        <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                          Explorer
+                        </p>
+                        <div className="flex items-center gap-1">
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            className="h-7 w-7 p-0"
+                            disabled={!selectedThreadId || workspaceCurrentPath === "." || workspaceLoading}
+                            onClick={() =>
+                              selectedThreadId &&
+                              void loadWorkspaceDirectory(selectedThreadId, dirname(workspaceCurrentPath))
+                            }
+                          >
+                            <ArrowUp className="h-3.5 w-3.5" />
+                          </Button>
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            className="h-7 w-7 p-0"
+                            disabled={!selectedThreadId || workspaceLoading}
+                            onClick={() =>
+                              selectedThreadId &&
+                              void loadWorkspaceDirectory(selectedThreadId, workspaceCurrentPath)
+                            }
+                          >
+                            <RefreshCw className="h-3.5 w-3.5" />
+                          </Button>
+                        </div>
+                      </div>
+
+                      <div className="flex flex-wrap items-center gap-1 text-[11px] text-muted-foreground">
+                        <button
+                          className="rounded bg-muted px-1.5 py-0.5 hover:bg-muted/70"
+                          onClick={() => selectedThreadId && void loadWorkspaceDirectory(selectedThreadId, ".")}
+                        >
+                          root
+                        </button>
+                        {workspacePathSegments.map((segment, index) => {
+                          const path = workspacePathSegments.slice(0, index + 1).join("/");
+                          return (
+                            <button
+                              key={`${segment}-${index}`}
+                              className="rounded bg-muted px-1.5 py-0.5 hover:bg-muted/70"
+                              onClick={() =>
+                                selectedThreadId && void loadWorkspaceDirectory(selectedThreadId, path)
+                              }
+                            >
+                              {segment}
+                            </button>
+                          );
+                        })}
+                      </div>
+                      {workspaceRoot && (
+                        <p className="mt-1 truncate text-[10px] text-muted-foreground">{workspaceRoot}</p>
+                      )}
+                    </div>
+
+                    <ScrollArea className="min-h-0 flex-1 p-2">
+                      {workspaceError ? (
+                        <p className="text-xs text-rose-600">{workspaceError}</p>
+                      ) : workspaceLoading ? (
+                        <p className="text-xs text-muted-foreground">Loading files...</p>
+                      ) : workspaceEntries.length === 0 ? (
+                        <p className="text-xs text-muted-foreground">No files in this folder.</p>
+                      ) : (
+                        <div className="space-y-1">
+                          {workspaceEntries.map((entry) => (
+                            <button
+                              key={entry.path}
+                              className={`flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-xs hover:bg-muted ${
+                                entry.type === "file" && activeFilePath === entry.path
+                                  ? "bg-primary/10"
+                                  : ""
+                              }`}
+                              onClick={() => {
+                                if (!selectedThreadId) {
+                                  return;
+                                }
+
+                                if (entry.type === "directory") {
+                                  void loadWorkspaceDirectory(selectedThreadId, entry.path);
+                                  return;
+                                }
+
+                                void openWorkspaceFile(entry.path);
+                              }}
+                            >
+                              {entry.type === "directory" ? (
+                                <Folder className="h-3.5 w-3.5 text-sky-500" />
+                              ) : (
+                                <File className="h-3.5 w-3.5 text-muted-foreground" />
+                              )}
+                              <span className="truncate">{entry.name}</span>
+                            </button>
+                          ))}
+                        </div>
+                      )}
+                    </ScrollArea>
+                  </aside>
+
+                  <div className="flex min-h-0 flex-col">
+                    <div className="flex items-center justify-between border-b border-border px-2 py-1.5">
+                      <div className="flex min-w-0 items-center gap-1 overflow-x-auto">
+                        {fileTabs.length === 0 ? (
+                          <p className="px-2 text-xs text-muted-foreground">Open a file from explorer</p>
+                        ) : (
+                          fileTabs.map((tab) => {
+                            const active = tab.path === activeFilePath;
+                            const dirty = tab.content !== tab.savedContent;
+                            return (
+                              <div
+                                key={tab.path}
+                                className={`flex items-center gap-1 rounded-md border px-2 py-1 text-xs ${
+                                  active ? "border-primary/40 bg-primary/10" : "border-border bg-background"
+                                }`}
+                              >
+                                <button
+                                  className="max-w-[220px] truncate"
+                                  onClick={() => setActiveFilePath(tab.path)}
+                                >
+                                  {tab.path}
+                                  {dirty ? " *" : ""}
+                                </button>
+                                <button
+                                  className="rounded p-0.5 text-muted-foreground hover:bg-muted hover:text-foreground"
+                                  onClick={() => handleCloseFileTab(tab.path)}
+                                >
+                                  <X className="h-3 w-3" />
+                                </button>
+                              </div>
+                            );
+                          })
+                        )}
+                      </div>
+
+                      <div className="flex items-center gap-1">
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          className="h-7"
+                          disabled={!activeEditorTab || editorSavingPath === activeEditorTab.path}
+                          onClick={() => activeEditorTab && void handleReloadFile(activeEditorTab.path)}
+                        >
+                          Reload
+                        </Button>
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          className="h-7"
+                          disabled={dirtyTabCount === 0 || Boolean(editorSavingPath)}
+                          onClick={() => void handleSaveAllFiles()}
+                        >
+                          Save all ({dirtyTabCount})
+                        </Button>
+                        <Button
+                          size="sm"
+                          className="h-7"
+                          disabled={
+                            !activeEditorTab ||
+                            activeEditorTab.content === activeEditorTab.savedContent ||
+                            editorSavingPath === activeEditorTab.path
+                          }
+                          onClick={() => activeEditorTab && void handleSaveFile(activeEditorTab.path)}
+                        >
+                          Save
+                        </Button>
+                      </div>
+                    </div>
+
+                    {activeEditorTab ? (
+                      <>
+                        <div className="flex items-center justify-between border-b border-border px-3 py-1 text-[11px] text-muted-foreground">
+                          <span>{activeEditorTab.path}</span>
+                          {lineJumpTarget?.path === activeEditorTab.path && (
+                            <span>Line {lineJumpTarget.lineNumber}</span>
+                          )}
+                        </div>
+                        <div className="min-h-0 flex-1 overflow-hidden">
+                          <CodeMirror
+                            key={activeEditorTab.path}
+                            value={activeEditorTab.content}
+                            height="100%"
+                            theme={oneDark}
+                            extensions={[
+                              editorSurfaceTheme,
+                              ...languageExtensionsForPath(activeEditorTab.path),
+                            ]}
+                            onChange={(value) => handleUpdateActiveFile(value)}
+                            onCreateEditor={(editorView) => {
+                              editorViewRef.current = editorView;
+                              setEditorVersion((prev) => prev + 1);
+                            }}
+                            className="h-full text-[12px]"
+                            basicSetup={{
+                              foldGutter: true,
+                              highlightActiveLine: true,
+                              highlightSelectionMatches: true,
+                              lineNumbers: true,
+                            }}
+                          />
+                        </div>
+                      </>
+                    ) : (
+                      <div className="flex min-h-0 flex-1 items-center justify-center text-sm text-muted-foreground">
+                        Select a file to start editing.
+                      </div>
+                    )}
+
+                    {editorLoadingPath && (
+                      <div className="border-t border-border px-3 py-1 text-[11px] text-muted-foreground">
+                        Loading {editorLoadingPath}...
+                      </div>
+                    )}
                   </div>
-                )}
-              </ScrollArea>
+                </div>
+              )}
 
               <div className="border-t border-border bg-card px-5 py-4">
                 <div className="mx-auto max-w-3xl">
@@ -1336,6 +2056,7 @@ export default function App() {
                                   filePath: line.filePath,
                                   lineNumber: line.lineNumber,
                                 });
+                                void handleOpenFileAtLine(line.filePath, line.lineNumber);
                               }}
                             >
                               {line.text || " "}
@@ -1345,6 +2066,10 @@ export default function App() {
                       </div>
                     )}
                   </ScrollArea>
+
+                  <p className="mb-2 text-[11px] text-muted-foreground">
+                    Click any diff line to jump into the editor at that location.
+                  </p>
 
                   <div className="mb-3 rounded-lg border border-border bg-background p-2">
                     <p className="mb-1 text-xs text-muted-foreground">
@@ -1381,9 +2106,17 @@ export default function App() {
                               className="block cursor-pointer rounded-md border border-border p-2"
                             >
                               <div className="mb-1 flex items-center justify-between gap-2">
-                                <span className="truncate text-xs font-medium">
+                                <button
+                                  type="button"
+                                  className="truncate text-left text-xs font-medium underline decoration-dotted underline-offset-2"
+                                  onClick={(event) => {
+                                    event.preventDefault();
+                                    event.stopPropagation();
+                                    void handleOpenFileAtLine(comment.filePath, comment.lineNumber);
+                                  }}
+                                >
                                   {comment.filePath}:{comment.lineNumber}
-                                </span>
+                                </button>
                                 <input
                                   type="checkbox"
                                   checked={isChecked}
@@ -1425,6 +2158,40 @@ export default function App() {
                       {prd.format ?? "none"}
                     </Badge>
                   </div>
+
+                  {selectedThreadId && (
+                    <div className="mb-3 rounded-lg border border-border bg-background p-2.5">
+                      {bootstrapLoading ? (
+                        <p className="text-[11px] text-muted-foreground">Checking Ralph setup...</p>
+                      ) : bootstrapStatus === undefined ? (
+                        <p className="text-[11px] text-muted-foreground">
+                          Unable to determine setup status right now.
+                        </p>
+                      ) : !bootstrapStatus.initialized ? (
+                        <>
+                          <p className="mb-1 text-[11px] text-amber-600">
+                            Ralph setup is incomplete for this workspace.
+                          </p>
+                          <p className="mb-2 text-[11px] text-muted-foreground">
+                            Missing: {bootstrapStatus.missing.join(", ")}
+                          </p>
+                          <Button
+                            size="sm"
+                            className="h-7 w-full"
+                            disabled={bootstrapInitializing}
+                            onClick={() => void handleInitializeRalphWorkspace()}
+                          >
+                            {bootstrapInitializing ? "Initializing..." : "Initialize Ralph Files"}
+                          </Button>
+                        </>
+                      ) : (
+                        <p className="text-[11px] text-emerald-600">Ralph setup is ready.</p>
+                      )}
+                      {bootstrapMessage && (
+                        <p className="mt-2 text-[11px] text-muted-foreground">{bootstrapMessage}</p>
+                      )}
+                    </div>
+                  )}
 
                   {!selectedThreadId ? (
                     <div className="rounded-lg border border-border bg-background p-3 text-xs text-muted-foreground">

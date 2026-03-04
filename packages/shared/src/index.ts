@@ -168,3 +168,18 @@ export interface WriteWorkspaceFileRequest {
   path: string;
   content: string;
 }
+
+export interface RalphBootstrapStatus {
+  initialized: boolean;
+  hasPrd: boolean;
+  hasRalphConfig: boolean;
+  hasRalphDirectory: boolean;
+  hasRalphGitignore: boolean;
+  missing: string[];
+}
+
+export interface RalphBootstrapResult {
+  status: RalphBootstrapStatus;
+  created: string[];
+  skipped: string[];
+}

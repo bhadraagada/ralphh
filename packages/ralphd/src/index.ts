@@ -1,5 +1,5 @@
 import { mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises";
-import { dirname, extname, isAbsolute, relative, resolve } from "node:path";
+import { dirname, extname, isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { existsSync, mkdirSync } from "node:fs";
 import { randomUUID } from "node:crypto";
@@ -23,7 +23,9 @@ import {
 import type { RalphConfig } from "../../../src/config/schema.js";
 import { spawnProcess } from "../../../src/utils/process.js";
 import { runTaskLoop, type LoopEvent } from "../../../src/loop/runner.js";
+import { generateDefaultConfig } from "../../../src/config/loader.js";
 import { discoverPrd } from "../../../src/prd/loader.js";
+import { generateDefaultPrd } from "../../../src/prd/loader.js";
 import { parseMarkdownPrd } from "../../../src/prd/markdown.js";
 import { PrdSchema, resolveTasks, validateUniqueIds } from "../../../src/prd/schema.js";
 import { RalphDatabase } from "./db.js";
@@ -366,6 +368,91 @@ function validatePrdContent(format: PrdFormat, content: string): void {
   resolveTasks(prd);
 }
 
+function getBootstrapStatus(workspaceRoot: string): {
+  initialized: boolean;
+  hasPrd: boolean;
+  hasRalphConfig: boolean;
+  hasRalphDirectory: boolean;
+  hasRalphGitignore: boolean;
+  missing: string[];
+} {
+  const discoveredPrd = discoverPrd(workspaceRoot);
+  const hasPrd = Boolean(discoveredPrd);
+  const hasRalphConfig = existsSync(join(workspaceRoot, "ralph.json"));
+  const hasRalphDirectory = existsSync(join(workspaceRoot, "ralph"));
+  const hasRalphGitignore = existsSync(join(workspaceRoot, "ralph", ".gitignore"));
+
+  const missing: string[] = [];
+  if (!hasPrd) {
+    missing.push("prd.json/prd.md");
+  }
+  if (!hasRalphConfig) {
+    missing.push("ralph.json");
+  }
+  if (!hasRalphDirectory) {
+    missing.push("ralph/");
+  }
+  if (!hasRalphGitignore) {
+    missing.push("ralph/.gitignore");
+  }
+
+  return {
+    initialized: missing.length === 0,
+    hasPrd,
+    hasRalphConfig,
+    hasRalphDirectory,
+    hasRalphGitignore,
+    missing,
+  };
+}
+
+async function initializeWorkspaceFiles(workspaceRoot: string): Promise<{
+  created: string[];
+  skipped: string[];
+}> {
+  const created: string[] = [];
+  const skipped: string[] = [];
+
+  const ralphDirPath = join(workspaceRoot, "ralph");
+  if (!existsSync(ralphDirPath)) {
+    await mkdir(ralphDirPath, { recursive: true });
+    created.push("ralph/");
+  } else {
+    skipped.push("ralph/");
+  }
+
+  const discoveredPrd = discoverPrd(workspaceRoot);
+  if (!discoveredPrd) {
+    const prdPath = join(workspaceRoot, "prd.json");
+    await writeFile(prdPath, `${JSON.stringify(generateDefaultPrd(), null, 2)}\n`, "utf-8");
+    created.push("prd.json");
+  } else {
+    skipped.push("prd.json/prd.md");
+  }
+
+  const configPath = join(workspaceRoot, "ralph.json");
+  if (!existsSync(configPath)) {
+    await writeFile(configPath, `${JSON.stringify(generateDefaultConfig(), null, 2)}\n`, "utf-8");
+    created.push("ralph.json");
+  } else {
+    skipped.push("ralph.json");
+  }
+
+  const gitignorePath = join(ralphDirPath, ".gitignore");
+  if (!existsSync(gitignorePath)) {
+    await writeFile(
+      gitignorePath,
+      "# Ralph runtime files -- don't commit these\nralph-progress.md\n",
+      "utf-8"
+    );
+    created.push("ralph/.gitignore");
+  } else {
+    skipped.push("ralph/.gitignore");
+  }
+
+  return { created, skipped };
+}
+
 const server = Bun.serve({
   hostname: process.env.RALPHD_HOST ?? DEFAULT_HOST,
   port: Number(process.env.RALPHD_PORT ?? DEFAULT_PORT),
@@ -574,6 +661,51 @@ const server = Bun.serve({
             path: toRelativeWorkspacePath(workspaceRoot, prdPath),
             content: body.content,
           },
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        return json({ error: message }, 400);
+      }
+    }
+
+    if (
+      request.method === "GET" &&
+      parts.length === 3 &&
+      parts[0] === "threads" &&
+      parts[2] === "bootstrap"
+    ) {
+      const threadId = parts[1];
+      const thread = db.getThread(threadId);
+      if (!thread) {
+        return json({ error: "Thread not found" }, 404);
+      }
+
+      const workspaceRoot = getThreadWorkspaceRoot(thread);
+      return json({
+        status: getBootstrapStatus(workspaceRoot),
+      });
+    }
+
+    if (
+      request.method === "POST" &&
+      parts.length === 4 &&
+      parts[0] === "threads" &&
+      parts[2] === "bootstrap" &&
+      parts[3] === "init"
+    ) {
+      const threadId = parts[1];
+      const thread = db.getThread(threadId);
+      if (!thread) {
+        return json({ error: "Thread not found" }, 404);
+      }
+
+      try {
+        const workspaceRoot = getThreadWorkspaceRoot(thread);
+        const result = await initializeWorkspaceFiles(workspaceRoot);
+
+        return json({
+          ...result,
+          status: getBootstrapStatus(workspaceRoot),
         });
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
