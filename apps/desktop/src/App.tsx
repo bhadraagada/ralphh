@@ -42,6 +42,8 @@ import type {
   RunStatus,
   ThreadRecord,
   WorkspaceFileEntryRecord,
+  WorkspaceFileIndexResponse,
+  WorkspaceFileWriteConflict,
 } from "@ralphh/shared";
 import type { Extension } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
@@ -73,6 +75,7 @@ interface FileEditorTab {
   path: string;
   content: string;
   savedContent: string;
+  mtimeMs?: number;
 }
 
 type ThemeMode = "light" | "dark";
@@ -339,10 +342,85 @@ function parseUnifiedDiff(diff: string): DiffLine[] {
   return parsed;
 }
 
+const EDITOR_SESSION_STORAGE_KEY = "ralph-editor-sessions-v1";
+
+interface EditorSessionEntry {
+  tabs: string[];
+  activePath?: string;
+  currentPath?: string;
+  centerPaneMode?: "activity" | "editor";
+}
+
+class ApiError extends Error {
+  status: number;
+  body: unknown;
+
+  constructor(message: string, status: number, body: unknown) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+    this.body = body;
+  }
+}
+
+function readEditorSessions(): Record<string, EditorSessionEntry> {
+  try {
+    const raw = localStorage.getItem(EDITOR_SESSION_STORAGE_KEY);
+    if (!raw) {
+      return {};
+    }
+
+    const parsed = JSON.parse(raw) as Record<string, EditorSessionEntry>;
+    if (!parsed || typeof parsed !== "object") {
+      return {};
+    }
+    return parsed;
+  } catch {
+    return {};
+  }
+}
+
+function writeEditorSessions(sessions: Record<string, EditorSessionEntry>): void {
+  try {
+    localStorage.setItem(EDITOR_SESSION_STORAGE_KEY, JSON.stringify(sessions));
+  } catch {
+    return;
+  }
+}
+
+function isEditableTarget(target: EventTarget | null): boolean {
+  if (!(target instanceof HTMLElement)) {
+    return false;
+  }
+
+  if (target.isContentEditable) {
+    return true;
+  }
+
+  const tag = target.tagName;
+  return tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT";
+}
+
+function isWorkspaceConflict(value: unknown): value is {
+  conflict: WorkspaceFileWriteConflict;
+} {
+  if (!value || typeof value !== "object") {
+    return false;
+  }
+
+  const maybe = value as { conflict?: WorkspaceFileWriteConflict };
+  return Boolean(maybe.conflict && typeof maybe.conflict.path === "string");
+}
+
 async function getJson<T>(path: string): Promise<T> {
   const response = await fetch(`${API_BASE}${path}`);
   if (!response.ok) {
-    throw new Error(`Request failed: ${response.status}`);
+    const body = await response.json().catch(() => undefined);
+    const message =
+      body && typeof body === "object" && "error" in body && typeof body.error === "string"
+        ? body.error
+        : `Request failed: ${response.status}`;
+    throw new ApiError(message, response.status, body);
   }
   return response.json() as Promise<T>;
 }
@@ -357,8 +435,12 @@ async function postJson<T>(path: string, payload: unknown): Promise<T> {
   });
 
   if (!response.ok) {
-    const body = (await response.json().catch(() => ({}))) as { error?: string };
-    throw new Error(body.error ?? `Request failed: ${response.status}`);
+    const body = await response.json().catch(() => undefined);
+    const message =
+      body && typeof body === "object" && "error" in body && typeof body.error === "string"
+        ? body.error
+        : `Request failed: ${response.status}`;
+    throw new ApiError(message, response.status, body);
   }
 
   return response.json() as Promise<T>;
@@ -408,6 +490,7 @@ export default function App() {
   const [workspaceRoot, setWorkspaceRoot] = useState("");
   const [workspaceCurrentPath, setWorkspaceCurrentPath] = useState(".");
   const [workspaceEntries, setWorkspaceEntries] = useState<WorkspaceFileEntryRecord[]>([]);
+  const [workspaceFileIndex, setWorkspaceFileIndex] = useState<string[]>([]);
   const [workspaceLoading, setWorkspaceLoading] = useState(false);
   const [workspaceError, setWorkspaceError] = useState<string | undefined>();
   const [fileTabs, setFileTabs] = useState<FileEditorTab[]>([]);
@@ -415,6 +498,8 @@ export default function App() {
   const [editorLoadingPath, setEditorLoadingPath] = useState<string | undefined>();
   const [editorSavingPath, setEditorSavingPath] = useState<string | undefined>();
   const [lineJumpTarget, setLineJumpTarget] = useState<{ path: string; lineNumber: number }>();
+  const [quickOpenOpen, setQuickOpenOpen] = useState(false);
+  const [quickOpenQuery, setQuickOpenQuery] = useState("");
   const editorViewRef = useRef<EditorView | null>(null);
   const [editorVersion, setEditorVersion] = useState(0);
 
@@ -457,10 +542,30 @@ export default function App() {
     () => fileTabs.filter((tab) => tab.content !== tab.savedContent).length,
     [fileTabs]
   );
+  const hasUnsavedFiles = dirtyTabCount > 0;
   const workspacePathSegments = useMemo(
     () => workspaceCurrentPath.split("/").filter(Boolean),
     [workspaceCurrentPath]
   );
+  const quickOpenCandidates = useMemo(() => {
+    const query = quickOpenQuery.trim().toLowerCase();
+    const files = workspaceFileIndex;
+    if (!query) {
+      return files.slice(0, 40);
+    }
+
+    return files
+      .filter((path) => path.toLowerCase().includes(query))
+      .sort((a, b) => {
+        const aStarts = a.toLowerCase().startsWith(query) ? 0 : 1;
+        const bStarts = b.toLowerCase().startsWith(query) ? 0 : 1;
+        if (aStarts !== bStarts) {
+          return aStarts - bStarts;
+        }
+        return a.length - b.length;
+      })
+      .slice(0, 60);
+  }, [workspaceFileIndex, quickOpenQuery]);
 
   useEffect(() => {
     const storedTheme = localStorage.getItem("ralph-theme");
@@ -603,6 +708,7 @@ export default function App() {
       await Promise.all([
         loadPrd(selectedThreadId),
         loadWorkspaceDirectory(selectedThreadId, "."),
+        loadWorkspaceFileIndex(selectedThreadId),
         loadThreads(),
       ]);
       setError(undefined);
@@ -632,6 +738,66 @@ export default function App() {
     }
   }
 
+  async function loadWorkspaceFileIndex(threadId: string): Promise<void> {
+    try {
+      const data = await getJson<WorkspaceFileIndexResponse>(`/threads/${threadId}/files/index`);
+      setWorkspaceFileIndex(data.files);
+    } catch {
+      setWorkspaceFileIndex([]);
+    }
+  }
+
+  function confirmDiscardUnsavedChanges(nextAction: string): boolean {
+    if (!hasUnsavedFiles) {
+      return true;
+    }
+
+    return window.confirm(
+      `You have ${dirtyTabCount} unsaved file${dirtyTabCount === 1 ? "" : "s"}. ${nextAction} and discard unsaved changes?`
+    );
+  }
+
+  function requestThreadSelection(threadId: string): void {
+    if (threadId === selectedThreadId) {
+      return;
+    }
+
+    if (!confirmDiscardUnsavedChanges("Switch threads")) {
+      return;
+    }
+
+    setSelectedThreadId(threadId);
+  }
+
+  async function restoreEditorSession(threadId: string): Promise<void> {
+    const sessions = readEditorSessions();
+    const session = sessions[threadId];
+    if (!session) {
+      return;
+    }
+
+    if (session.centerPaneMode) {
+      setCenterPaneMode(session.centerPaneMode);
+    }
+
+    if (session.currentPath && session.currentPath !== workspaceCurrentPath) {
+      await loadWorkspaceDirectory(threadId, session.currentPath);
+    }
+
+    if (!session.tabs || session.tabs.length === 0) {
+      return;
+    }
+
+    const uniqueTabs = Array.from(new Set(session.tabs)).slice(0, 8);
+    for (const path of uniqueTabs) {
+      await openWorkspaceFile(path);
+    }
+
+    if (session.activePath && uniqueTabs.includes(session.activePath)) {
+      setActiveFilePath(session.activePath);
+    }
+  }
+
   async function openWorkspaceFile(
     filePath: string,
     options: { forceReload?: boolean; lineNumber?: number } = {}
@@ -658,6 +824,7 @@ export default function App() {
       const file = data.file ?? {
         path: data.path ?? filePath,
         content: data.content ?? "",
+        mtimeMs: typeof data.mtimeMs === "number" ? data.mtimeMs : Date.now(),
       };
 
       setFileTabs((prev) => {
@@ -669,6 +836,7 @@ export default function App() {
               path: file.path,
               content: file.content,
               savedContent: file.content,
+              mtimeMs: file.mtimeMs,
             },
           ];
         }
@@ -678,6 +846,7 @@ export default function App() {
           ...next[index],
           content: file.content,
           savedContent: file.content,
+          mtimeMs: file.mtimeMs,
         };
         return next;
       });
@@ -706,7 +875,7 @@ export default function App() {
     );
   }
 
-  async function handleSaveFile(filePath: string): Promise<void> {
+  async function handleSaveFile(filePath: string, options: { force?: boolean } = {}): Promise<void> {
     if (!selectedThreadId) {
       return;
     }
@@ -723,18 +892,21 @@ export default function App() {
         {
           path: tab.path,
           content: tab.content,
+          expectedMtimeMs: tab.mtimeMs,
+          force: options.force,
         }
       );
 
       const file = data.file ?? {
         path: data.path ?? tab.path,
         content: data.content ?? tab.content,
+        mtimeMs: data.mtimeMs ?? tab.mtimeMs,
       };
 
       setFileTabs((prev) =>
         prev.map((item) =>
           item.path === file.path
-            ? { ...item, content: file.content, savedContent: file.content }
+            ? { ...item, content: file.content, savedContent: file.content, mtimeMs: file.mtimeMs }
             : item
         )
       );
@@ -750,8 +922,25 @@ export default function App() {
 
       setError(undefined);
       await loadWorkspaceDirectory(selectedThreadId, dirname(file.path));
+      await loadWorkspaceFileIndex(selectedThreadId);
       await loadBootstrapStatus(selectedThreadId);
     } catch (saveError) {
+      if (saveError instanceof ApiError && saveError.status === 409 && isWorkspaceConflict(saveError.body)) {
+        const conflict = saveError.body.conflict;
+        const overwrite = window.confirm(
+          `${conflict.path} changed on disk since it was opened.\n\nPress OK to overwrite with your editor contents, or Cancel to reload the latest disk version.`
+        );
+
+        if (overwrite) {
+          await handleSaveFile(filePath, { force: true });
+          return;
+        }
+
+        await openWorkspaceFile(filePath, { forceReload: true });
+        setError("Reloaded latest version from disk.");
+        return;
+      }
+
       const message = saveError instanceof Error ? saveError.message : String(saveError);
       setError(message);
       setWorkspaceError(message);
@@ -850,6 +1039,7 @@ export default function App() {
       setWorkspaceRoot("");
       setWorkspaceCurrentPath(".");
       setWorkspaceEntries([]);
+      setWorkspaceFileIndex([]);
       setWorkspaceError(undefined);
       setBootstrapStatus(undefined);
       setBootstrapMessage(undefined);
@@ -872,7 +1062,6 @@ export default function App() {
     void loadComments(selectedThreadId);
     void loadPrd(selectedThreadId);
     void loadBootstrapStatus(selectedThreadId);
-    void loadWorkspaceDirectory(selectedThreadId, ".");
     setSelectedDiffLine(undefined);
     setCommentBody("");
     setSelectedCommentIds([]);
@@ -880,7 +1069,105 @@ export default function App() {
     setFileTabs([]);
     setActiveFilePath(undefined);
     setLineJumpTarget(undefined);
+
+    void (async () => {
+      try {
+        await loadWorkspaceDirectory(selectedThreadId, ".");
+        await loadWorkspaceFileIndex(selectedThreadId);
+        await restoreEditorSession(selectedThreadId);
+      } catch {
+        return;
+      }
+    })();
   }, [selectedThreadId]);
+
+  useEffect(() => {
+    if (!selectedThreadId) {
+      return;
+    }
+
+    const sessions = readEditorSessions();
+    sessions[selectedThreadId] = {
+      tabs: fileTabs.map((tab) => tab.path),
+      activePath: activeFilePath,
+      currentPath: workspaceCurrentPath,
+      centerPaneMode,
+    };
+    writeEditorSessions(sessions);
+  }, [selectedThreadId, fileTabs, activeFilePath, workspaceCurrentPath, centerPaneMode]);
+
+  useEffect(() => {
+    if (!hasUnsavedFiles) {
+      return;
+    }
+
+    const handler = (event: BeforeUnloadEvent) => {
+      event.preventDefault();
+      event.returnValue = "";
+    };
+
+    window.addEventListener("beforeunload", handler);
+    return () => window.removeEventListener("beforeunload", handler);
+  }, [hasUnsavedFiles]);
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      const mod = event.metaKey || event.ctrlKey;
+      const key = event.key.toLowerCase();
+
+      if (mod && key === "s") {
+        event.preventDefault();
+        if (event.shiftKey) {
+          void handleSaveAllFiles();
+          return;
+        }
+
+        if (activeEditorTab) {
+          void handleSaveFile(activeEditorTab.path);
+        }
+        return;
+      }
+
+      if (mod && key === "p" && selectedThreadId) {
+        event.preventDefault();
+        setCenterPaneMode("editor");
+        setQuickOpenQuery("");
+        setQuickOpenOpen(true);
+        return;
+      }
+
+      if (quickOpenOpen && key === "escape") {
+        event.preventDefault();
+        setQuickOpenOpen(false);
+        return;
+      }
+
+      if (mod && key === "w" && activeEditorTab) {
+        event.preventDefault();
+        handleCloseFileTab(activeEditorTab.path);
+        return;
+      }
+
+      if (mod && key === "1") {
+        event.preventDefault();
+        setCenterPaneMode("activity");
+        return;
+      }
+
+      if (mod && key === "2") {
+        event.preventDefault();
+        setCenterPaneMode("editor");
+        return;
+      }
+
+      if (isEditableTarget(event.target)) {
+        return;
+      }
+    };
+
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [activeEditorTab, quickOpenOpen, selectedThreadId]);
 
   useEffect(() => {
     if (!lineJumpTarget || lineJumpTarget.path !== activeFilePath || !editorViewRef.current) {
@@ -946,7 +1233,7 @@ export default function App() {
       setShowCreateThread(false);
       setError(undefined);
       await loadThreads();
-      setSelectedThreadId(created.thread.id);
+      requestThreadSelection(created.thread.id);
     } catch (createError) {
       setError(createError instanceof Error ? createError.message : String(createError));
     }
@@ -1078,6 +1365,7 @@ export default function App() {
       if (created.prd.path) {
         setCenterPaneMode("editor");
         await loadWorkspaceDirectory(selectedThreadId, dirname(created.prd.path));
+        await loadWorkspaceFileIndex(selectedThreadId);
         await openWorkspaceFile(created.prd.path, { forceReload: true });
       }
       await loadBootstrapStatus(selectedThreadId);
@@ -1204,6 +1492,10 @@ export default function App() {
   }
 
   async function handleWindowClose(): Promise<void> {
+    if (!confirmDiscardUnsavedChanges("Close window")) {
+      return;
+    }
+
     if (!windowControls) {
       window.close();
       return;
@@ -1377,7 +1669,7 @@ export default function App() {
                 <button
                   key={`wf-${thread.id}`}
                   className="mb-1.5 flex w-full items-center justify-between rounded-md border border-transparent px-2 py-1.5 text-left hover:border-border hover:bg-muted/60"
-                  onClick={() => setSelectedThreadId(thread.id)}
+                  onClick={() => requestThreadSelection(thread.id)}
                 >
                   <div className="min-w-0">
                     <p className="truncate text-sm font-medium">{thread.name}</p>
@@ -1409,7 +1701,7 @@ export default function App() {
                       ? "border-primary/40 bg-primary/10"
                       : "border-transparent hover:border-border hover:bg-muted/60"
                   }`}
-                  onClick={() => setSelectedThreadId(thread.id)}
+                  onClick={() => requestThreadSelection(thread.id)}
                 >
                   <div className="mb-1 flex items-center justify-between gap-2">
                     <p className="truncate text-sm font-medium">{thread.name}</p>
@@ -1510,6 +1802,22 @@ export default function App() {
                       </div>
                     )}
                   </div>
+
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    disabled={!selectedThreadId}
+                    onClick={() => {
+                      setCenterPaneMode("editor");
+                      setQuickOpenQuery("");
+                      setQuickOpenOpen(true);
+                    }}
+                  >
+                    Quick Open
+                    <span className="ml-2 rounded border border-border px-1.5 py-0.5 text-[10px] text-muted-foreground">
+                      Ctrl/Cmd+P
+                    </span>
+                  </Button>
 
                   <Button
                     variant="outline"
@@ -1756,6 +2064,7 @@ export default function App() {
                           className="h-7"
                           disabled={!activeEditorTab || editorSavingPath === activeEditorTab.path}
                           onClick={() => activeEditorTab && void handleReloadFile(activeEditorTab.path)}
+                          title="Reload file"
                         >
                           Reload
                         </Button>
@@ -1765,6 +2074,7 @@ export default function App() {
                           className="h-7"
                           disabled={dirtyTabCount === 0 || Boolean(editorSavingPath)}
                           onClick={() => void handleSaveAllFiles()}
+                          title="Ctrl/Cmd+Shift+S"
                         >
                           Save all ({dirtyTabCount})
                         </Button>
@@ -1777,6 +2087,7 @@ export default function App() {
                             editorSavingPath === activeEditorTab.path
                           }
                           onClick={() => activeEditorTab && void handleSaveFile(activeEditorTab.path)}
+                          title="Ctrl/Cmd+S"
                         >
                           Save
                         </Button>
@@ -2175,6 +2486,9 @@ export default function App() {
                           <p className="mb-2 text-[11px] text-muted-foreground">
                             Missing: {bootstrapStatus.missing.join(", ")}
                           </p>
+                          <p className="mb-2 text-[11px] text-muted-foreground">
+                            Initialize will create only the missing Ralph files.
+                          </p>
                           <Button
                             size="sm"
                             className="h-7 w-full"
@@ -2268,6 +2582,58 @@ export default function App() {
             </aside>
           </section>
         </main>
+
+        {quickOpenOpen && (
+          <div
+            className="fixed inset-0 z-40 flex items-start justify-center bg-black/35 p-6"
+            role="dialog"
+            onClick={() => setQuickOpenOpen(false)}
+          >
+            <div
+              className="mt-16 w-full max-w-2xl rounded-lg border border-border bg-card shadow-2xl"
+              onClick={(event) => event.stopPropagation()}
+            >
+              <div className="border-b border-border p-3">
+                <Input
+                  autoFocus
+                  placeholder="Quick open file..."
+                  value={quickOpenQuery}
+                  onChange={(event) => setQuickOpenQuery(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter" && quickOpenCandidates.length > 0) {
+                      event.preventDefault();
+                      void openWorkspaceFile(quickOpenCandidates[0]);
+                      setQuickOpenOpen(false);
+                    }
+                  }}
+                />
+                <p className="mt-2 text-[11px] text-muted-foreground">
+                  Enter to open first match. Esc to close.
+                </p>
+              </div>
+
+              <ScrollArea className="h-[340px] p-2">
+                {quickOpenCandidates.length === 0 ? (
+                  <p className="p-2 text-xs text-muted-foreground">No matching files.</p>
+                ) : (
+                  quickOpenCandidates.map((path) => (
+                    <button
+                      key={path}
+                      className="mb-1 flex w-full items-center justify-between rounded-md px-2 py-1.5 text-left text-xs hover:bg-muted"
+                      onClick={() => {
+                        void openWorkspaceFile(path);
+                        setQuickOpenOpen(false);
+                      }}
+                    >
+                      <span className="truncate">{path}</span>
+                      {activeFilePath === path && <Badge variant="info">open</Badge>}
+                    </button>
+                  ))
+                )}
+              </ScrollArea>
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );

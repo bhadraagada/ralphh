@@ -86,10 +86,14 @@ const savePrdSchema = z.object({
 const writeWorkspaceFileSchema = z.object({
   path: z.string().min(1),
   content: z.string(),
+  expectedMtimeMs: z.number().finite().nonnegative().optional(),
+  force: z.boolean().optional(),
 });
 
 const WORKSPACE_LIST_BLOCKLIST = new Set([".git", "node_modules", ".turbo"]);
 const MAX_TEXT_FILE_BYTES = 512 * 1024;
+const MTIME_TOLERANCE_MS = 5;
+const MAX_WORKSPACE_INDEX_FILES = 5000;
 
 const here = dirname(fileURLToPath(import.meta.url));
 const defaultDbPath = resolve(here, "../data/ralph-studio.db");
@@ -329,6 +333,38 @@ async function listWorkspaceEntries(
       }
       return a.name.localeCompare(b.name);
     });
+}
+
+async function buildWorkspaceFileIndex(workspaceRoot: string): Promise<string[]> {
+  const files: string[] = [];
+  const queue: string[] = [workspaceRoot];
+
+  while (queue.length > 0 && files.length < MAX_WORKSPACE_INDEX_FILES) {
+    const current = queue.shift();
+    if (!current) {
+      continue;
+    }
+
+    const entries = await readdir(current, { withFileTypes: true });
+    for (const entry of entries) {
+      if (WORKSPACE_LIST_BLOCKLIST.has(entry.name)) {
+        continue;
+      }
+
+      const absolutePath = resolve(current, entry.name);
+      if (entry.isDirectory()) {
+        queue.push(absolutePath);
+        continue;
+      }
+
+      files.push(toRelativeWorkspacePath(workspaceRoot, absolutePath));
+      if (files.length >= MAX_WORKSPACE_INDEX_FILES) {
+        break;
+      }
+    }
+  }
+
+  return files.sort((a, b) => a.localeCompare(b));
 }
 
 function detectPrdFormat(path: string): PrdFormat {
@@ -751,6 +787,29 @@ const server = Bun.serve({
       parts.length === 4 &&
       parts[0] === "threads" &&
       parts[2] === "files" &&
+      parts[3] === "index"
+    ) {
+      const threadId = parts[1];
+      const thread = db.getThread(threadId);
+      if (!thread) {
+        return json({ error: "Thread not found" }, 404);
+      }
+
+      try {
+        const workspaceRoot = getThreadWorkspaceRoot(thread);
+        const files = await buildWorkspaceFileIndex(workspaceRoot);
+        return json({ files, maxFiles: MAX_WORKSPACE_INDEX_FILES });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        return json({ error: message }, 400);
+      }
+    }
+
+    if (
+      request.method === "GET" &&
+      parts.length === 4 &&
+      parts[0] === "threads" &&
+      parts[2] === "files" &&
       parts[3] === "read"
     ) {
       const threadId = parts[1];
@@ -785,6 +844,7 @@ const server = Bun.serve({
           file: {
             path: toRelativeWorkspacePath(workspaceRoot, filePath),
             content,
+            mtimeMs: info.mtimeMs,
           },
         });
       } catch (error) {
@@ -814,13 +874,48 @@ const server = Bun.serve({
 
         const workspaceRoot = getThreadWorkspaceRoot(thread);
         const filePath = resolveWorkspacePath(workspaceRoot, body.path);
+
+        const fileStat = await stat(filePath).catch(() => undefined);
+        if (fileStat?.isDirectory()) {
+          return json({ error: "Path is a directory" }, 400);
+        }
+
+        if (!body.force && body.expectedMtimeMs !== undefined && fileStat) {
+          const delta = Math.abs(fileStat.mtimeMs - body.expectedMtimeMs);
+          if (delta > MTIME_TOLERANCE_MS) {
+            let conflictContent: string | undefined;
+            if (fileStat.size <= MAX_TEXT_FILE_BYTES) {
+              const candidate = await readFile(filePath, "utf-8");
+              if (!candidate.includes("\0")) {
+                conflictContent = candidate;
+              }
+            }
+
+            return json(
+              {
+                error: "File has changed on disk since you opened it",
+                code: "file_conflict",
+                conflict: {
+                  path: toRelativeWorkspacePath(workspaceRoot, filePath),
+                  expectedMtimeMs: body.expectedMtimeMs,
+                  actualMtimeMs: fileStat.mtimeMs,
+                  currentContent: conflictContent,
+                },
+              },
+              409
+            );
+          }
+        }
+
         await mkdir(dirname(filePath), { recursive: true });
         await writeFile(filePath, body.content, "utf-8");
+        const updatedStat = await stat(filePath);
 
         return json({
           file: {
             path: toRelativeWorkspacePath(workspaceRoot, filePath),
             content: body.content,
+            mtimeMs: updatedStat.mtimeMs,
           },
         });
       } catch (error) {

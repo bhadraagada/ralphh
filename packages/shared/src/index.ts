@@ -159,14 +159,29 @@ export interface ListWorkspaceFilesResponse {
   entries: WorkspaceFileEntryRecord[];
 }
 
+export interface WorkspaceFileIndexResponse {
+  files: string[];
+  maxFiles: number;
+}
+
 export interface ReadWorkspaceFileResponse {
   path: string;
   content: string;
+  mtimeMs: number;
 }
 
 export interface WriteWorkspaceFileRequest {
   path: string;
   content: string;
+  expectedMtimeMs?: number;
+  force?: boolean;
+}
+
+export interface WorkspaceFileWriteConflict {
+  path: string;
+  expectedMtimeMs?: number;
+  actualMtimeMs: number;
+  currentContent?: string;
 }
 
 export interface RalphBootstrapStatus {
