@@ -25,13 +25,14 @@ export interface ValidationReport {
  */
 export async function runValidations(
   commands: string[],
-  cwd: string
+  cwd: string,
+  signal?: AbortSignal
 ): Promise<ValidationReport> {
   const results: ValidationResult[] = [];
 
   for (const cmd of commands) {
     log.info(`Running validation: ${cmd}`);
-    const result = await runShellCommand(cmd, cwd);
+    const result = await runShellCommand(cmd, cwd, signal);
 
     results.push({
       command: cmd,
