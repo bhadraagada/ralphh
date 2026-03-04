@@ -130,3 +130,41 @@ export interface CreateAutomationRequest {
   maxIterations?: number;
   enabled?: boolean;
 }
+
+export type PrdFormat = "json" | "markdown";
+
+export interface PrdDocumentRecord {
+  exists: boolean;
+  format: PrdFormat | null;
+  path: string | null;
+  content: string;
+  validationError?: string;
+}
+
+export interface SavePrdRequest {
+  content: string;
+  format?: PrdFormat;
+  path?: string;
+}
+
+export interface WorkspaceFileEntryRecord {
+  name: string;
+  path: string;
+  type: "file" | "directory";
+}
+
+export interface ListWorkspaceFilesResponse {
+  root: string;
+  currentPath: string;
+  entries: WorkspaceFileEntryRecord[];
+}
+
+export interface ReadWorkspaceFileResponse {
+  path: string;
+  content: string;
+}
+
+export interface WriteWorkspaceFileRequest {
+  path: string;
+  content: string;
+}

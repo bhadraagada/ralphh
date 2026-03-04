@@ -28,6 +28,8 @@ import type {
   AutomationRecord,
   BroadcastEnvelope,
   EventRecord,
+  PrdDocumentRecord,
+  PrdFormat,
   ReviewCommentRecord,
   RunRecord,
   RunStatus,
@@ -55,6 +57,44 @@ interface DiffLine {
 type ThemeMode = "light" | "dark";
 
 const API_BASE = "http://127.0.0.1:4242";
+
+const DEFAULT_PRD_JSON = `{
+  "name": "My Project",
+  "description": "Describe the project goals and scope.",
+  "validate": [
+    "bun test"
+  ],
+  "maxIterations": 50,
+  "tasks": [
+    {
+      "id": "task-1",
+      "name": "First Task",
+      "description": "Describe the first deliverable.",
+      "acceptanceCriteria": [
+        "All tests pass"
+      ]
+    }
+  ]
+}`;
+
+const DEFAULT_PRD_MARKDOWN = `# My Project
+
+Describe the project goals and scope.
+
+## task-1: First Task
+
+Describe the first deliverable.
+
+### Acceptance Criteria
+- All tests pass
+
+### Validate
+- \`bun test\`
+`;
+
+function defaultPrdTemplate(format: PrdFormat): string {
+  return format === "json" ? DEFAULT_PRD_JSON : DEFAULT_PRD_MARKDOWN;
+}
 
 function formatTime(ts?: number): string {
   if (!ts) {
@@ -254,13 +294,21 @@ export default function App() {
   const [selectedWorkspace, setSelectedWorkspace] = useState<string>("all");
   const [composerText, setComposerText] = useState("");
   const [isWindowMaximized, setIsWindowMaximized] = useState(false);
-  const [rightPanelTab, setRightPanelTab] = useState<"controls" | "review">("controls");
+  const [rightPanelTab, setRightPanelTab] = useState<"controls" | "review" | "plan">("controls");
   const [diffText, setDiffText] = useState("");
   const [comments, setComments] = useState<ReviewCommentRecord[]>([]);
   const [selectedDiffLine, setSelectedDiffLine] = useState<{ filePath: string; lineNumber: number }>();
   const [commentBody, setCommentBody] = useState("");
   const [selectedCommentIds, setSelectedCommentIds] = useState<number[]>([]);
   const [reviewLoading, setReviewLoading] = useState(false);
+  const [prd, setPrd] = useState<PrdDocumentRecord>({
+    exists: false,
+    format: null,
+    path: null,
+    content: "",
+  });
+  const [prdLoading, setPrdLoading] = useState(false);
+  const [prdSaving, setPrdSaving] = useState(false);
 
   const workspaces = useMemo(
     () => Array.from(new Set(threads.map((bundle) => bundle.thread.repoPath))),
@@ -384,6 +432,24 @@ export default function App() {
     }
   }
 
+  async function loadPrd(threadId: string): Promise<void> {
+    setPrdLoading(true);
+    try {
+      const data = await getJson<{ prd: PrdDocumentRecord }>(`/threads/${threadId}/prd`);
+      setPrd(data.prd);
+    } catch (loadError) {
+      setPrd({
+        exists: false,
+        format: null,
+        path: null,
+        content: "",
+      });
+      setError(loadError instanceof Error ? loadError.message : String(loadError));
+    } finally {
+      setPrdLoading(false);
+    }
+  }
+
   useEffect(() => {
     void loadThreads();
     void loadAutomations();
@@ -394,6 +460,12 @@ export default function App() {
       setEvents([]);
       setDiffText("");
       setComments([]);
+      setPrd({
+        exists: false,
+        format: null,
+        path: null,
+        content: "",
+      });
       setSelectedDiffLine(undefined);
       setCommentBody("");
       setSelectedCommentIds([]);
@@ -402,6 +474,7 @@ export default function App() {
     void loadEvents(selectedThreadId);
     void loadDiff(selectedThreadId);
     void loadComments(selectedThreadId);
+    void loadPrd(selectedThreadId);
     setSelectedDiffLine(undefined);
     setCommentBody("");
     setSelectedCommentIds([]);
@@ -563,6 +636,53 @@ export default function App() {
       await loadAutomations();
     } catch (automationError) {
       setError(automationError instanceof Error ? automationError.message : String(automationError));
+    }
+  }
+
+  async function handleCreatePrd(format: PrdFormat): Promise<void> {
+    if (!selectedThreadId) {
+      return;
+    }
+
+    setPrdSaving(true);
+    try {
+      const created = await postJson<{ prd: PrdDocumentRecord }>(`/threads/${selectedThreadId}/prd`, {
+        format,
+        content: defaultPrdTemplate(format),
+      });
+      setPrd(created.prd);
+      setRightPanelTab("plan");
+      setError(undefined);
+    } catch (saveError) {
+      setError(saveError instanceof Error ? saveError.message : String(saveError));
+    } finally {
+      setPrdSaving(false);
+    }
+  }
+
+  async function handleSavePrd(): Promise<void> {
+    if (!selectedThreadId) {
+      return;
+    }
+
+    if (!prd.content.trim()) {
+      setError("PRD content cannot be empty.");
+      return;
+    }
+
+    setPrdSaving(true);
+    try {
+      const saved = await postJson<{ prd: PrdDocumentRecord }>(`/threads/${selectedThreadId}/prd`, {
+        content: prd.content,
+        format: prd.format ?? "json",
+        path: prd.path ?? undefined,
+      });
+      setPrd(saved.prd);
+      setError(undefined);
+    } catch (saveError) {
+      setError(saveError instanceof Error ? saveError.message : String(saveError));
+    } finally {
+      setPrdSaving(false);
     }
   }
 
@@ -1067,7 +1187,7 @@ export default function App() {
             </div>
 
             <aside className="flex min-h-0 flex-col border-l border-border bg-card/80 p-4">
-              <div className="mb-3 grid grid-cols-2 gap-2 rounded-lg bg-muted p-1">
+              <div className="mb-3 grid grid-cols-3 gap-2 rounded-lg bg-muted p-1">
                 <button
                   className={`rounded-md px-2 py-1 text-xs font-medium ${
                     rightPanelTab === "controls" ? "bg-card" : "text-muted-foreground"
@@ -1083,6 +1203,14 @@ export default function App() {
                   onClick={() => setRightPanelTab("review")}
                 >
                   Review
+                </button>
+                <button
+                  className={`rounded-md px-2 py-1 text-xs font-medium ${
+                    rightPanelTab === "plan" ? "bg-card" : "text-muted-foreground"
+                  }`}
+                  onClick={() => setRightPanelTab("plan")}
+                >
+                  PRD
                 </button>
               </div>
 
@@ -1168,7 +1296,7 @@ export default function App() {
                     </div>
                   </div>
                 </>
-              ) : (
+              ) : rightPanelTab === "review" ? (
                 <>
                   <div className="mb-2 flex items-center justify-between">
                     <p className="text-sm font-semibold">Diff + Comments</p>
@@ -1288,6 +1416,81 @@ export default function App() {
                   >
                     {reviewLoading ? "Queueing rerun..." : "Rerun with selected feedback"}
                   </Button>
+                </>
+              ) : (
+                <>
+                  <div className="mb-2 flex items-center justify-between">
+                    <p className="text-sm font-semibold">PRD Studio</p>
+                    <Badge variant={prd.exists ? "success" : "default"}>
+                      {prd.format ?? "none"}
+                    </Badge>
+                  </div>
+
+                  {!selectedThreadId ? (
+                    <div className="rounded-lg border border-border bg-background p-3 text-xs text-muted-foreground">
+                      Select a thread to edit or create a PRD file.
+                    </div>
+                  ) : prdLoading ? (
+                    <div className="rounded-lg border border-border bg-background p-3 text-xs text-muted-foreground">
+                      Loading PRD...
+                    </div>
+                  ) : !prd.exists ? (
+                    <div className="space-y-3 rounded-lg border border-border bg-background p-3">
+                      <p className="text-xs text-muted-foreground">
+                        No PRD found in this thread worktree.
+                      </p>
+                      <div className="grid grid-cols-2 gap-2">
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          disabled={prdSaving}
+                          onClick={() => void handleCreatePrd("json")}
+                        >
+                          Create prd.json
+                        </Button>
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          disabled={prdSaving}
+                          onClick={() => void handleCreatePrd("markdown")}
+                        >
+                          Create prd.md
+                        </Button>
+                      </div>
+                    </div>
+                  ) : (
+                    <>
+                      <div className="mb-2 rounded-lg border border-border bg-background p-2">
+                        <p className="text-[11px] text-muted-foreground">
+                          {prd.path ? `Editing ${prd.path}` : "Editing PRD"}
+                        </p>
+                        {prd.validationError && (
+                          <p className="mt-1 text-[11px] text-rose-600">{prd.validationError}</p>
+                        )}
+                      </div>
+
+                      <Textarea
+                        className="min-h-[360px] font-mono text-xs"
+                        value={prd.content}
+                        onChange={(event) =>
+                          setPrd((prev) => ({
+                            ...prev,
+                            content: event.target.value,
+                            validationError: undefined,
+                          }))
+                        }
+                      />
+
+                      <Button
+                        className="mt-3 w-full"
+                        size="sm"
+                        disabled={prdSaving || !prd.content.trim()}
+                        onClick={() => void handleSavePrd()}
+                      >
+                        {prdSaving ? "Saving PRD..." : "Save PRD"}
+                      </Button>
+                    </>
+                  )}
                 </>
               )}
 
