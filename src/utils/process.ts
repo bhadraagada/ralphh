@@ -13,6 +13,7 @@ export interface SpawnConfig {
   cwd?: string;
   env?: Record<string, string>;
   timeout?: number;
+  signal?: AbortSignal;
 }
 
 /**
@@ -26,6 +27,7 @@ export async function spawnProcess(config: SpawnConfig): Promise<SpawnResult> {
       cwd: config.cwd,
       env: { ...process.env, ...config.env },
       timeout: config.timeout,
+      signal: config.signal,
       reject: false, // don't throw on non-zero exit
       all: true, // merge stdout+stderr into .all
     });
@@ -52,7 +54,8 @@ export async function spawnProcess(config: SpawnConfig): Promise<SpawnResult> {
  */
 export async function runShellCommand(
   cmd: string,
-  cwd?: string
+  cwd?: string,
+  signal?: AbortSignal
 ): Promise<SpawnResult> {
   const start = Date.now();
   try {
@@ -60,6 +63,7 @@ export async function runShellCommand(
       cwd,
       shell: true,
       reject: false,
+      signal,
       env: process.env,
     });
 
