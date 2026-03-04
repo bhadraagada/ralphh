@@ -130,3 +130,71 @@ export interface CreateAutomationRequest {
   maxIterations?: number;
   enabled?: boolean;
 }
+
+export type PrdFormat = "json" | "markdown";
+
+export interface PrdDocumentRecord {
+  exists: boolean;
+  format: PrdFormat | null;
+  path: string | null;
+  content: string;
+  validationError?: string;
+}
+
+export interface SavePrdRequest {
+  content: string;
+  format?: PrdFormat;
+  path?: string;
+}
+
+export interface WorkspaceFileEntryRecord {
+  name: string;
+  path: string;
+  type: "file" | "directory";
+}
+
+export interface ListWorkspaceFilesResponse {
+  root: string;
+  currentPath: string;
+  entries: WorkspaceFileEntryRecord[];
+}
+
+export interface WorkspaceFileIndexResponse {
+  files: string[];
+  maxFiles: number;
+}
+
+export interface ReadWorkspaceFileResponse {
+  path: string;
+  content: string;
+  mtimeMs: number;
+}
+
+export interface WriteWorkspaceFileRequest {
+  path: string;
+  content: string;
+  expectedMtimeMs?: number;
+  force?: boolean;
+}
+
+export interface WorkspaceFileWriteConflict {
+  path: string;
+  expectedMtimeMs?: number;
+  actualMtimeMs: number;
+  currentContent?: string;
+}
+
+export interface RalphBootstrapStatus {
+  initialized: boolean;
+  hasPrd: boolean;
+  hasRalphConfig: boolean;
+  hasRalphDirectory: boolean;
+  hasRalphGitignore: boolean;
+  missing: string[];
+}
+
+export interface RalphBootstrapResult {
+  status: RalphBootstrapStatus;
+  created: string[];
+  skipped: string[];
+}

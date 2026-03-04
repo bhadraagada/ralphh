@@ -4,6 +4,7 @@ declare global {
   interface Window {
     ralphDesktop?: {
       platform: string;
+      pickDirectory?: (options?: { title?: string; defaultPath?: string }) => Promise<string | null>;
       windowControls?: {
         minimize: () => Promise<boolean>;
         toggleMaximize: () => Promise<boolean>;

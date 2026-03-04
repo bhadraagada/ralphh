@@ -1,7 +1,8 @@
-import { contextBridge, ipcRenderer } from "electron";
+const { contextBridge, ipcRenderer } = require("electron");
 
 contextBridge.exposeInMainWorld("ralphDesktop", {
   platform: process.platform,
+  pickDirectory: (options) => ipcRenderer.invoke("dialog:pick-directory", options),
   windowControls: {
     minimize: () => ipcRenderer.invoke("window:minimize"),
     toggleMaximize: () => ipcRenderer.invoke("window:toggle-maximize"),

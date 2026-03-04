@@ -1,4 +1,5 @@
-import { dirname, resolve } from "node:path";
+import { mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises";
+import { dirname, extname, isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { existsSync, mkdirSync } from "node:fs";
 import { randomUUID } from "node:crypto";
@@ -12,13 +13,21 @@ import {
   type EventRecord,
   type EventType,
   type FeedbackRerunRequest,
+  type PrdFormat,
   type RunControlRequest,
   type RunRecord,
   type ThreadRecord,
+  type SavePrdRequest,
+  type WriteWorkspaceFileRequest,
 } from "@ralphh/shared";
 import type { RalphConfig } from "../../../src/config/schema.js";
 import { spawnProcess } from "../../../src/utils/process.js";
 import { runTaskLoop, type LoopEvent } from "../../../src/loop/runner.js";
+import { generateDefaultConfig } from "../../../src/config/loader.js";
+import { discoverPrd } from "../../../src/prd/loader.js";
+import { generateDefaultPrd } from "../../../src/prd/loader.js";
+import { parseMarkdownPrd } from "../../../src/prd/markdown.js";
+import { PrdSchema, resolveTasks, validateUniqueIds } from "../../../src/prd/schema.js";
 import { RalphDatabase } from "./db.js";
 import { AutomationScheduler } from "./automation-scheduler.js";
 import { RunQueue, TERMINAL_RUN_STATES } from "./queue.js";
@@ -67,6 +76,24 @@ const createReviewCommentSchema = z.object({
 const feedbackRerunSchema = z.object({
   commentIds: z.array(z.number().int().positive()).min(1),
 });
+
+const savePrdSchema = z.object({
+  content: z.string(),
+  format: z.enum(["json", "markdown"]).optional(),
+  path: z.string().min(1).optional(),
+});
+
+const writeWorkspaceFileSchema = z.object({
+  path: z.string().min(1),
+  content: z.string(),
+  expectedMtimeMs: z.number().finite().nonnegative().optional(),
+  force: z.boolean().optional(),
+});
+
+const WORKSPACE_LIST_BLOCKLIST = new Set([".git", "node_modules", ".turbo"]);
+const MAX_TEXT_FILE_BYTES = 512 * 1024;
+const MTIME_TOLERANCE_MS = 5;
+const MAX_WORKSPACE_INDEX_FILES = 5000;
 
 const here = dirname(fileURLToPath(import.meta.url));
 const defaultDbPath = resolve(here, "../data/ralph-studio.db");
@@ -250,6 +277,218 @@ function threadSummary(thread: ThreadRecord): {
   };
 }
 
+function getThreadWorkspaceRoot(thread: ThreadRecord): string {
+  return resolve(thread.worktreePath ?? thread.repoPath);
+}
+
+function toRelativeWorkspacePath(workspaceRoot: string, absolutePath: string): string {
+  const rel = relative(workspaceRoot, absolutePath).split("\\").join("/");
+  return rel.length === 0 ? "." : rel;
+}
+
+function resolveWorkspacePath(
+  workspaceRoot: string,
+  inputPath: string,
+  allowRoot = false
+): string {
+  const normalized = inputPath.replace(/\\/g, "/").replace(/^\/+/, "");
+
+  if (!allowRoot && normalized.trim().length === 0) {
+    throw new Error("Path is required");
+  }
+
+  if (normalized.includes("\0")) {
+    throw new Error("Invalid path");
+  }
+
+  const absolutePath = resolve(workspaceRoot, normalized || ".");
+  const rel = relative(workspaceRoot, absolutePath);
+  if (rel.startsWith("..") || isAbsolute(rel)) {
+    throw new Error("Path escapes thread workspace");
+  }
+
+  return absolutePath;
+}
+
+async function listWorkspaceEntries(
+  workspaceRoot: string,
+  directoryPath: string
+): Promise<Array<{ name: string; path: string; type: "file" | "directory" }>> {
+  const entries = await readdir(directoryPath, { withFileTypes: true });
+
+  return entries
+    .filter((entry) => !WORKSPACE_LIST_BLOCKLIST.has(entry.name))
+    .map((entry) => {
+      const absolutePath = resolve(directoryPath, entry.name);
+      const type: "file" | "directory" = entry.isDirectory() ? "directory" : "file";
+      return {
+        name: entry.name,
+        path: toRelativeWorkspacePath(workspaceRoot, absolutePath),
+        type,
+      };
+    })
+    .sort((a, b) => {
+      if (a.type !== b.type) {
+        return a.type === "directory" ? -1 : 1;
+      }
+      return a.name.localeCompare(b.name);
+    });
+}
+
+async function buildWorkspaceFileIndex(workspaceRoot: string): Promise<string[]> {
+  const files: string[] = [];
+  const queue: string[] = [workspaceRoot];
+
+  while (queue.length > 0 && files.length < MAX_WORKSPACE_INDEX_FILES) {
+    const current = queue.shift();
+    if (!current) {
+      continue;
+    }
+
+    const entries = await readdir(current, { withFileTypes: true });
+    for (const entry of entries) {
+      if (WORKSPACE_LIST_BLOCKLIST.has(entry.name)) {
+        continue;
+      }
+
+      const absolutePath = resolve(current, entry.name);
+      if (entry.isDirectory()) {
+        queue.push(absolutePath);
+        continue;
+      }
+
+      files.push(toRelativeWorkspacePath(workspaceRoot, absolutePath));
+      if (files.length >= MAX_WORKSPACE_INDEX_FILES) {
+        break;
+      }
+    }
+  }
+
+  return files.sort((a, b) => a.localeCompare(b));
+}
+
+function detectPrdFormat(path: string): PrdFormat {
+  return extname(path).toLowerCase() === ".json" ? "json" : "markdown";
+}
+
+function isSupportedPrdPath(relativePath: string): boolean {
+  const normalized = relativePath.replace(/\\/g, "/").toLowerCase();
+  return (
+    normalized === "prd.json" ||
+    normalized === "prd.md" ||
+    normalized === "prd.markdown" ||
+    normalized.endsWith("/prd.json") ||
+    normalized.endsWith("/prd.md") ||
+    normalized.endsWith("/prd.markdown")
+  );
+}
+
+function validatePrdContent(format: PrdFormat, content: string): void {
+  if (format === "json") {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(content);
+    } catch {
+      throw new Error("Invalid JSON in prd.json");
+    }
+
+    const prd = PrdSchema.parse(parsed);
+    validateUniqueIds(prd);
+    resolveTasks(prd);
+    return;
+  }
+
+  const rawPrd = parseMarkdownPrd(content);
+  const prd = PrdSchema.parse(rawPrd);
+  validateUniqueIds(prd);
+  resolveTasks(prd);
+}
+
+function getBootstrapStatus(workspaceRoot: string): {
+  initialized: boolean;
+  hasPrd: boolean;
+  hasRalphConfig: boolean;
+  hasRalphDirectory: boolean;
+  hasRalphGitignore: boolean;
+  missing: string[];
+} {
+  const discoveredPrd = discoverPrd(workspaceRoot);
+  const hasPrd = Boolean(discoveredPrd);
+  const hasRalphConfig = existsSync(join(workspaceRoot, "ralph.json"));
+  const hasRalphDirectory = existsSync(join(workspaceRoot, "ralph"));
+  const hasRalphGitignore = existsSync(join(workspaceRoot, "ralph", ".gitignore"));
+
+  const missing: string[] = [];
+  if (!hasPrd) {
+    missing.push("prd.json/prd.md");
+  }
+  if (!hasRalphConfig) {
+    missing.push("ralph.json");
+  }
+  if (!hasRalphDirectory) {
+    missing.push("ralph/");
+  }
+  if (!hasRalphGitignore) {
+    missing.push("ralph/.gitignore");
+  }
+
+  return {
+    initialized: missing.length === 0,
+    hasPrd,
+    hasRalphConfig,
+    hasRalphDirectory,
+    hasRalphGitignore,
+    missing,
+  };
+}
+
+async function initializeWorkspaceFiles(workspaceRoot: string): Promise<{
+  created: string[];
+  skipped: string[];
+}> {
+  const created: string[] = [];
+  const skipped: string[] = [];
+
+  const ralphDirPath = join(workspaceRoot, "ralph");
+  if (!existsSync(ralphDirPath)) {
+    await mkdir(ralphDirPath, { recursive: true });
+    created.push("ralph/");
+  } else {
+    skipped.push("ralph/");
+  }
+
+  const discoveredPrd = discoverPrd(workspaceRoot);
+  if (!discoveredPrd) {
+    const prdPath = join(workspaceRoot, "prd.json");
+    await writeFile(prdPath, `${JSON.stringify(generateDefaultPrd(), null, 2)}\n`, "utf-8");
+    created.push("prd.json");
+  } else {
+    skipped.push("prd.json/prd.md");
+  }
+
+  const configPath = join(workspaceRoot, "ralph.json");
+  if (!existsSync(configPath)) {
+    await writeFile(configPath, `${JSON.stringify(generateDefaultConfig(), null, 2)}\n`, "utf-8");
+    created.push("ralph.json");
+  } else {
+    skipped.push("ralph.json");
+  }
+
+  const gitignorePath = join(ralphDirPath, ".gitignore");
+  if (!existsSync(gitignorePath)) {
+    await writeFile(
+      gitignorePath,
+      "# Ralph runtime files -- don't commit these\nralph-progress.md\n",
+      "utf-8"
+    );
+    created.push("ralph/.gitignore");
+  } else {
+    skipped.push("ralph/.gitignore");
+  }
+
+  return { created, skipped };
+}
+
 const server = Bun.serve({
   hostname: process.env.RALPHD_HOST ?? DEFAULT_HOST,
   port: Number(process.env.RALPHD_PORT ?? DEFAULT_PORT),
@@ -346,6 +585,339 @@ const server = Bun.serve({
         });
 
         return json({ thread }, 201);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        return json({ error: message }, 400);
+      }
+    }
+
+    if (
+      request.method === "GET" &&
+      parts.length === 3 &&
+      parts[0] === "threads" &&
+      parts[2] === "prd"
+    ) {
+      const threadId = parts[1];
+      const thread = db.getThread(threadId);
+      if (!thread) {
+        return json({ error: "Thread not found" }, 404);
+      }
+
+      const workspaceRoot = getThreadWorkspaceRoot(thread);
+      const discovered = discoverPrd(workspaceRoot);
+      if (!discovered) {
+        return json({
+          prd: {
+            exists: false,
+            format: null,
+            path: null,
+            content: "",
+          },
+        });
+      }
+
+      try {
+        const fileStat = await stat(discovered.path);
+        if (fileStat.size > MAX_TEXT_FILE_BYTES) {
+          return json({ error: "PRD file is too large to open in desktop" }, 413);
+        }
+
+        const content = await readFile(discovered.path, "utf-8");
+        let validationError: string | undefined;
+        try {
+          validatePrdContent(discovered.format, content);
+        } catch (error) {
+          validationError = error instanceof Error ? error.message : String(error);
+        }
+
+        return json({
+          prd: {
+            exists: true,
+            format: discovered.format,
+            path: toRelativeWorkspacePath(workspaceRoot, discovered.path),
+            content,
+            validationError,
+          },
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        return json({ error: message }, 400);
+      }
+    }
+
+    if (
+      request.method === "POST" &&
+      parts.length === 3 &&
+      parts[0] === "threads" &&
+      parts[2] === "prd"
+    ) {
+      const threadId = parts[1];
+      const thread = db.getThread(threadId);
+      if (!thread) {
+        return json({ error: "Thread not found" }, 404);
+      }
+
+      try {
+        const body = await readJson<SavePrdRequest>(request, savePrdSchema);
+        const workspaceRoot = getThreadWorkspaceRoot(thread);
+
+        let prdPath: string;
+        let prdFormat: PrdFormat;
+
+        if (body.path) {
+          prdPath = resolveWorkspacePath(workspaceRoot, body.path);
+          const relPath = toRelativeWorkspacePath(workspaceRoot, prdPath);
+          if (!isSupportedPrdPath(relPath)) {
+            return json({ error: "PRD path must be prd.json or prd.md" }, 400);
+          }
+          prdFormat = detectPrdFormat(relPath);
+        } else {
+          const discovered = discoverPrd(workspaceRoot);
+          if (discovered) {
+            prdPath = discovered.path;
+            prdFormat = discovered.format;
+          } else {
+            prdFormat = body.format ?? "json";
+            prdPath = resolve(workspaceRoot, prdFormat === "json" ? "prd.json" : "prd.md");
+          }
+        }
+
+        if (Buffer.byteLength(body.content, "utf-8") > MAX_TEXT_FILE_BYTES) {
+          return json({ error: "PRD content exceeds editor size limit" }, 413);
+        }
+
+        validatePrdContent(prdFormat, body.content);
+        await mkdir(dirname(prdPath), { recursive: true });
+        await writeFile(prdPath, body.content, "utf-8");
+
+        return json({
+          prd: {
+            exists: true,
+            format: prdFormat,
+            path: toRelativeWorkspacePath(workspaceRoot, prdPath),
+            content: body.content,
+          },
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        return json({ error: message }, 400);
+      }
+    }
+
+    if (
+      request.method === "GET" &&
+      parts.length === 3 &&
+      parts[0] === "threads" &&
+      parts[2] === "bootstrap"
+    ) {
+      const threadId = parts[1];
+      const thread = db.getThread(threadId);
+      if (!thread) {
+        return json({ error: "Thread not found" }, 404);
+      }
+
+      const workspaceRoot = getThreadWorkspaceRoot(thread);
+      return json({
+        status: getBootstrapStatus(workspaceRoot),
+      });
+    }
+
+    if (
+      request.method === "POST" &&
+      parts.length === 4 &&
+      parts[0] === "threads" &&
+      parts[2] === "bootstrap" &&
+      parts[3] === "init"
+    ) {
+      const threadId = parts[1];
+      const thread = db.getThread(threadId);
+      if (!thread) {
+        return json({ error: "Thread not found" }, 404);
+      }
+
+      try {
+        const workspaceRoot = getThreadWorkspaceRoot(thread);
+        const result = await initializeWorkspaceFiles(workspaceRoot);
+
+        return json({
+          ...result,
+          status: getBootstrapStatus(workspaceRoot),
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        return json({ error: message }, 400);
+      }
+    }
+
+    if (
+      request.method === "GET" &&
+      parts.length === 3 &&
+      parts[0] === "threads" &&
+      parts[2] === "files"
+    ) {
+      const threadId = parts[1];
+      const thread = db.getThread(threadId);
+      if (!thread) {
+        return json({ error: "Thread not found" }, 404);
+      }
+
+      try {
+        const workspaceRoot = getThreadWorkspaceRoot(thread);
+        const requestedPath = url.searchParams.get("path") ?? "";
+        const directoryPath = resolveWorkspacePath(workspaceRoot, requestedPath, true);
+        const info = await stat(directoryPath);
+        if (!info.isDirectory()) {
+          return json({ error: "Path is not a directory" }, 400);
+        }
+
+        const entries = await listWorkspaceEntries(workspaceRoot, directoryPath);
+        return json({
+          root: workspaceRoot,
+          currentPath: toRelativeWorkspacePath(workspaceRoot, directoryPath),
+          entries,
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        return json({ error: message }, 400);
+      }
+    }
+
+    if (
+      request.method === "GET" &&
+      parts.length === 4 &&
+      parts[0] === "threads" &&
+      parts[2] === "files" &&
+      parts[3] === "index"
+    ) {
+      const threadId = parts[1];
+      const thread = db.getThread(threadId);
+      if (!thread) {
+        return json({ error: "Thread not found" }, 404);
+      }
+
+      try {
+        const workspaceRoot = getThreadWorkspaceRoot(thread);
+        const files = await buildWorkspaceFileIndex(workspaceRoot);
+        return json({ files, maxFiles: MAX_WORKSPACE_INDEX_FILES });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        return json({ error: message }, 400);
+      }
+    }
+
+    if (
+      request.method === "GET" &&
+      parts.length === 4 &&
+      parts[0] === "threads" &&
+      parts[2] === "files" &&
+      parts[3] === "read"
+    ) {
+      const threadId = parts[1];
+      const thread = db.getThread(threadId);
+      if (!thread) {
+        return json({ error: "Thread not found" }, 404);
+      }
+
+      const requestedPath = url.searchParams.get("path");
+      if (!requestedPath) {
+        return json({ error: "Query parameter 'path' is required" }, 400);
+      }
+
+      try {
+        const workspaceRoot = getThreadWorkspaceRoot(thread);
+        const filePath = resolveWorkspacePath(workspaceRoot, requestedPath);
+        const info = await stat(filePath);
+        if (!info.isFile()) {
+          return json({ error: "Path is not a file" }, 400);
+        }
+
+        if (info.size > MAX_TEXT_FILE_BYTES) {
+          return json({ error: "File is too large to open in desktop editor" }, 413);
+        }
+
+        const content = await readFile(filePath, "utf-8");
+        if (content.includes("\0")) {
+          return json({ error: "Binary files are not supported in this editor" }, 415);
+        }
+
+        return json({
+          file: {
+            path: toRelativeWorkspacePath(workspaceRoot, filePath),
+            content,
+            mtimeMs: info.mtimeMs,
+          },
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        return json({ error: message }, 400);
+      }
+    }
+
+    if (
+      request.method === "POST" &&
+      parts.length === 4 &&
+      parts[0] === "threads" &&
+      parts[2] === "files" &&
+      parts[3] === "write"
+    ) {
+      const threadId = parts[1];
+      const thread = db.getThread(threadId);
+      if (!thread) {
+        return json({ error: "Thread not found" }, 404);
+      }
+
+      try {
+        const body = await readJson<WriteWorkspaceFileRequest>(request, writeWorkspaceFileSchema);
+        if (Buffer.byteLength(body.content, "utf-8") > MAX_TEXT_FILE_BYTES) {
+          return json({ error: "File content exceeds editor size limit" }, 413);
+        }
+
+        const workspaceRoot = getThreadWorkspaceRoot(thread);
+        const filePath = resolveWorkspacePath(workspaceRoot, body.path);
+
+        const fileStat = await stat(filePath).catch(() => undefined);
+        if (fileStat?.isDirectory()) {
+          return json({ error: "Path is a directory" }, 400);
+        }
+
+        if (!body.force && body.expectedMtimeMs !== undefined && fileStat) {
+          const delta = Math.abs(fileStat.mtimeMs - body.expectedMtimeMs);
+          if (delta > MTIME_TOLERANCE_MS) {
+            let conflictContent: string | undefined;
+            if (fileStat.size <= MAX_TEXT_FILE_BYTES) {
+              const candidate = await readFile(filePath, "utf-8");
+              if (!candidate.includes("\0")) {
+                conflictContent = candidate;
+              }
+            }
+
+            return json(
+              {
+                error: "File has changed on disk since you opened it",
+                code: "file_conflict",
+                conflict: {
+                  path: toRelativeWorkspacePath(workspaceRoot, filePath),
+                  expectedMtimeMs: body.expectedMtimeMs,
+                  actualMtimeMs: fileStat.mtimeMs,
+                  currentContent: conflictContent,
+                },
+              },
+              409
+            );
+          }
+        }
+
+        await mkdir(dirname(filePath), { recursive: true });
+        await writeFile(filePath, body.content, "utf-8");
+        const updatedStat = await stat(filePath);
+
+        return json({
+          file: {
+            path: toRelativeWorkspacePath(workspaceRoot, filePath),
+            content: body.content,
+            mtimeMs: updatedStat.mtimeMs,
+          },
+        });
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         return json({ error: message }, 400);

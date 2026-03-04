@@ -1,4 +1,4 @@
-import { app, BrowserWindow, ipcMain, shell } from "electron";
+import { app, BrowserWindow, dialog, ipcMain, shell } from "electron";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -20,11 +20,13 @@ function createWindow() {
     frame: false,
     titleBarStyle: "hidden",
     webPreferences: {
-      preload: join(__dirname, "preload.js"),
+      preload: join(__dirname, "preload.cjs"),
       contextIsolation: true,
       nodeIntegration: false,
     },
   });
+
+  window.maximize();
 
   window.on("maximize", () => {
     window.webContents.send("window:maximized-changed", true);
@@ -79,6 +81,21 @@ ipcMain.handle("window:close", () => {
 ipcMain.handle("window:is-maximized", () => {
   const window = getActiveWindow();
   return window ? window.isMaximized() : false;
+});
+
+ipcMain.handle("dialog:pick-directory", async (_event, options) => {
+  const activeWindow = getActiveWindow() ?? undefined;
+  const result = await dialog.showOpenDialog(activeWindow, {
+    title: options?.title ?? "Select folder",
+    defaultPath: typeof options?.defaultPath === "string" ? options.defaultPath : undefined,
+    properties: ["openDirectory", "createDirectory"],
+  });
+
+  if (result.canceled) {
+    return null;
+  }
+
+  return result.filePaths[0] ?? null;
 });
 
 app.whenReady().then(() => {
